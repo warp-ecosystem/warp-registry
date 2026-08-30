@@ -1,0 +1,20 @@
+{
+  "name": "warp-registry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Warp Registry — A Node registry of extensions created with Warp Compiler.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "acorn": "^8.11.3",
+    "better-sqlite3": "^11.3.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "semver": "^7.6.2"
+  }
+}

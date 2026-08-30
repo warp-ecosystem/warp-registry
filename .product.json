@@ -1,0 +1,4 @@
+{
+  "name": "Warp Registry",
+  "description": "Registry for publishing and fetching compiled TurboWarp extensions."
+}

@@ -1,0 +1,222 @@
+import { test, before, after, describe } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
+import { openDatabase, blobPath } from "../src/db.js";
+import { createApp, hashToken } from "../src/routes.js";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const root = path.resolve(here, "..");
+const fixturesDir = path.join(root, "fixtures");
+
+async function startServer() {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "warp-registry-test-"));
+  const db = openDatabase(dataDir);
+  const app = createApp({ db, dataDir });
+  const server = app.listen(0);
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+  return { dataDir, db, server, base: `http://127.0.0.1:${port}` };
+}
+
+function insertOwner(db, username) {
+  const token = crypto.randomBytes(32).toString("hex");
+  db.prepare(
+    "INSERT INTO owners (github_username, token_hash, has_published) VALUES (?, ?, 0)",
+  ).run(username, hashToken(token));
+  return token;
+}
+
+function publish(base, token, fixture, contentType = "application/javascript") {
+  const body = fs.readFileSync(path.join(fixturesDir, fixture));
+  return fetch(`${base}/v1/publish`, {
+    method: "POST",
+    headers: {
+      "Content-Type": contentType,
+      Authorization: `Bearer ${token}`,
+    },
+    body,
+  });
+}
+
+function approve(username, packageId, version, dataDir) {
+  return execFileSync(
+    process.execPath,
+    [path.join(root, "scripts", "approve.js"), username, packageId, version],
+    { env: { ...process.env, DATA_DIR: dataDir } },
+  ).toString();
+}
+
+async function closeServer(server) {
+  await new Promise((resolve) => server.close(resolve));
+}
+
+describe("warp-registry publish flow", () => {
+  let server;
+  let dataDir;
+  let db;
+  let base;
+  let pendingOwnerToken;
+
+  before(async () => {
+    ({ server, dataDir, db, base } = await startServer());
+  });
+
+  after(async () => {
+    await closeServer(server);
+    db.close();
+  });
+
+  test("publishing for a brand-new owner results in status pending and 404 on info", async () => {
+    const token = insertOwner(db, "pendingowner");
+    pendingOwnerToken = token;
+    const res = await publish(base, token, "helloworld@0.1.0.js");
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.equal(body.owner, "pendingowner");
+    assert.equal(body.id, "helloworld");
+    assert.equal(body.version, "0.1.0");
+    assert.equal(body.status, "pending");
+    assert.equal(body.url, "/v1/pendingowner/helloworld/0.1.0");
+
+    const row = db
+      .prepare(
+        `SELECT v.* FROM versions v JOIN owners o ON o.id = v.owner_id
+         WHERE o.github_username = 'pendingowner'`,
+      )
+      .get();
+    assert.equal(row.status, "pending");
+    assert.equal(
+      row.blob_path,
+      blobPath(dataDir, "pendingowner", "helloworld", "0.1.0"),
+    );
+    assert.ok(fs.existsSync(row.blob_path));
+
+    const infoRes = await fetch(`${base}/v1/pendingowner/helloworld`);
+    assert.equal(infoRes.status, 404);
+
+    const blobRes = await fetch(`${base}/v1/pendingowner/helloworld/0.1.0`);
+    assert.equal(blobRes.status, 404);
+  });
+
+  test("after approve, re-publish is immediately published", async () => {
+    approve("pendingowner", "helloworld", "0.1.0", dataDir);
+
+    const res = await publish(base, pendingOwnerToken, "helloworld@0.1.0.js");
+    assert.equal(res.status, 409);
+    assert.equal((await res.json()).error.includes("already exists"), true);
+
+    const publishRes = await publishForVersion(
+      base,
+      pendingOwnerToken,
+      "0.1.1",
+    );
+    assert.equal(publishRes.status, 201);
+    const body = await publishRes.json();
+    assert.equal(body.status, "published");
+
+    const infoRes = await fetch(`${base}/v1/pendingowner/helloworld`);
+    assert.equal(infoRes.status, 200);
+    const info = await infoRes.json();
+    assert.equal(info.latestVersion, "0.1.1");
+    assert.deepEqual(info.versions, ["0.1.1", "0.1.0"]);
+  });
+
+  test("publishing same (owner, id, version) twice returns 409", async () => {
+    const token = insertOwner(db, "dupowner");
+    const first = await publish(base, token, "helloworld@0.1.0.js");
+    assert.equal(first.status, 201);
+
+    const second = await publish(base, token, "helloworld@0.1.0.js");
+    assert.equal(second.status, 409);
+  });
+
+  test("malformed meta returns 400 and never executes the file", async () => {
+    const token = insertOwner(db, "malowner");
+    const res = await publish(base, token, "malformed-meta.js");
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.match(body.error, /static literal/i);
+
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(
+        globalThis,
+        "__MALFORMED_SIDE_EFFECT__",
+      ),
+      false,
+      "uploaded code must never be executed",
+    );
+
+    const count = db
+      .prepare(
+        "SELECT COUNT(*) AS c FROM versions WHERE owner_id = (SELECT id FROM owners WHERE github_username='malowner')",
+      )
+      .get().c;
+    assert.equal(count, 0);
+  });
+
+  test("semver sorts 10.0.0 after 2.0.0", async () => {
+    const token = insertOwner(db, "semverowner");
+    const dataDirFor = dataDir;
+
+    const publishVersion = async (version) => {
+      const body = fs
+        .readFileSync(path.join(fixturesDir, "helloworld@0.1.0.js"))
+        .toString()
+        .replace('version: "0.1.0"', `version: "${version}"`)
+        .replace('id: "helloworld"', 'id: "semverpkg"');
+      const res = await fetch(`${base}/v1/publish`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/javascript",
+          Authorization: `Bearer ${token}`,
+        },
+        body,
+      });
+      assert.equal(res.status, 201);
+      const outer = await res.json();
+      approve(outer.owner, outer.id, outer.version, dataDirFor);
+    };
+
+    await publishVersion("2.0.0");
+    await publishVersion("10.0.0");
+
+    const infoRes = await fetch(`${base}/v1/semverowner/semverpkg`);
+    assert.equal(infoRes.status, 200);
+    const info = await infoRes.json();
+    assert.equal(info.latestVersion, "10.0.0");
+
+    const latestRes = await fetch(`${base}/v1/semverowner/semverpkg/latest`);
+    assert.equal(latestRes.status, 200);
+    const latestBody = await latestRes.text();
+    assert.match(latestBody, /"10\.0\.0"/);
+  });
+
+  test("invalid Bearer token gets 401", async () => {
+    const res = await publish(
+      base,
+      "definitely-not-a-valid-token",
+      "helloworld@0.1.0.js",
+    );
+    assert.equal(res.status, 401);
+  });
+});
+
+async function publishForVersion(base, token, version) {
+  const body = fs
+    .readFileSync(path.join(fixturesDir, "helloworld@0.1.0.js"))
+    .toString()
+    .replace('version: "0.1.0"', `version: "${version}"`);
+  return fetch(`${base}/v1/publish`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/javascript",
+      Authorization: `Bearer ${token}`,
+    },
+    body,
+  });
+}
