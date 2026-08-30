@@ -135,6 +135,37 @@ describe("warp-registry publish flow", () => {
     assert.equal(second.status, 409);
   });
 
+  test("concurrent publishes for the same version yield one 201 and one 409", async () => {
+    const token = insertOwner(db, "concurrentowner");
+
+    const [a, b] = await Promise.all([
+      publish(base, token, "helloworld@0.1.0.js"),
+      publish(base, token, "helloworld@0.1.0.js"),
+    ]);
+
+    const statuses = [a.status, b.status].sort();
+    assert.deepEqual(statuses, [201, 409]);
+
+    const row = db
+      .prepare(
+        `SELECT v.* FROM versions v JOIN owners o ON o.id = v.owner_id
+         WHERE o.github_username = 'concurrentowner'`,
+      )
+      .get();
+    assert.ok(row, "exactly one persisted version row");
+    assert.ok(fs.existsSync(row.blob_path), "blob must exist on disk");
+
+    const storedMeta = JSON.parse(row.meta_json);
+    const blobContents = fs.readFileSync(row.blob_path, "utf8");
+    assert.equal(storedMeta.version, "0.1.0");
+    assert.equal(storedMeta.id, "helloworld");
+    assert.equal(
+      blobContents.includes(`version: "0.1.0"`),
+      true,
+      "persisted blob content must match its stored metadata",
+    );
+  });
+
   test("malformed meta returns 400 and never executes the file", async () => {
     const token = insertOwner(db, "malowner");
     const res = await publish(base, token, "malformed-meta.js");

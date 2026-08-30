@@ -15,13 +15,7 @@ export function hashToken(token) {
 
 export function createApp({ db, dataDir, config = {} }) {
   const app = express();
-  app.use((err, req, res, next) => {
-    if (err && err.type === "entity.parse.failed") {
-      res.status(400).json({ error: "Malformed JSON body." });
-      return;
-    }
-    next(err);
-  });
+  app.use(express.json());
 
   app.get("/login", (req, res) => {
     const { GITHUB_CLIENT_ID: clientId } = config;
@@ -34,10 +28,13 @@ export function createApp({ db, dataDir, config = {} }) {
     const redirectUri = config.PUBLIC_BASE_URL
       ? `${config.PUBLIC_BASE_URL}/callback`
       : `${req.protocol}://${req.get("host")}/callback`;
+    const state = crypto.randomBytes(16).toString("hex");
+    setStateCookie(res, state, config);
     const params = new URLSearchParams({
       client_id: clientId,
       redirect_uri: redirectUri,
       scope: "read:user",
+      state,
     });
     res.redirect(
       `https://github.com/login/oauth/authorize?${params.toString()}`,
@@ -48,6 +45,11 @@ export function createApp({ db, dataDir, config = {} }) {
     const { code } = req.query;
     if (!code) {
       res.status(400).send("Missing `code` query parameter.");
+      return;
+    }
+    const state = req.query.state;
+    if (typeof state !== "string" || !verifyState(req, state, config)) {
+      res.status(400).send("Missing or invalid OAuth state.");
       return;
     }
     const { GITHUB_CLIENT_ID: clientId, GITHUB_CLIENT_SECRET: clientSecret } =
@@ -166,7 +168,19 @@ export function createApp({ db, dataDir, config = {} }) {
       return;
     }
 
-    const source = await readRawBody(req);
+    let source;
+    try {
+      source = await readRawBody(req);
+    } catch (bodyErr) {
+      if (bodyErr && bodyErr.statusCode === 413) {
+        res.status(413).json({ error: "Request body too large." });
+        error("Request body too large.");
+        return;
+      }
+      res.status(400).json({ error: "Failed to read request body." });
+      error("Failed to read request body.");
+      return;
+    }
 
     const { ok, meta, error: metaError } = extractWarpMeta(source);
     if (!ok) {
@@ -185,10 +199,8 @@ export function createApp({ db, dataDir, config = {} }) {
       );
       return;
     }
-    if (
-      typeof meta.version !== "string" ||
-      semver.valid(meta.version) === null
-    ) {
+    const version = semver.valid(meta.version);
+    if (version === null) {
       res.status(400).json({
         error: "meta.version must be a valid semver string.",
       });
@@ -206,7 +218,6 @@ export function createApp({ db, dataDir, config = {} }) {
     }
 
     const packageId = meta.id;
-    const version = meta.version;
     const ownerName = owner.github_username;
 
     const existing = db
@@ -225,20 +236,40 @@ export function createApp({ db, dataDir, config = {} }) {
     const status = owner.has_published === 1 ? "published" : "pending";
 
     const absBlobPath = blobPath(dataDir, ownerName, packageId, version);
-    fs.mkdirSync(path.dirname(absBlobPath), { recursive: true });
-    fs.writeFileSync(absBlobPath, source);
 
-    db.prepare(
-      `INSERT INTO versions (owner_id, package_id, version, status, meta_json, blob_path)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(
-      owner.id,
-      packageId,
-      version,
-      status,
-      JSON.stringify(meta),
-      absBlobPath,
-    );
+    const insertVersion = db.transaction(() => {
+      db.prepare(
+        `INSERT INTO versions (owner_id, package_id, version, status, meta_json, blob_path)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(
+        owner.id,
+        packageId,
+        version,
+        status,
+        JSON.stringify(meta),
+        absBlobPath,
+      );
+    });
+
+    try {
+      insertVersion();
+    } catch {
+      res
+        .status(409)
+        .json({ error: "This version already exists for this owner." });
+      error("This version already exists for this owner.");
+      return;
+    }
+
+    try {
+      fs.mkdirSync(path.dirname(absBlobPath), { recursive: true });
+      fs.writeFileSync(absBlobPath, source);
+    } catch (err) {
+      db.prepare(
+        `DELETE FROM versions WHERE owner_id = ? AND package_id = ? AND version = ?`,
+      ).run(owner.id, packageId, version);
+      throw err;
+    }
 
     res.status(201).json({
       owner: ownerName,
@@ -303,6 +334,14 @@ export function createApp({ db, dataDir, config = {} }) {
     serveBlob(req, res, { db, dataDir, owner, id, version });
   });
 
+  app.use((err, req, res, next) => {
+    if (err && err.type === "entity.parse.failed") {
+      res.status(400).json({ error: "Malformed JSON body." });
+      return;
+    }
+    next(err);
+  });
+
   return app;
 }
 
@@ -341,16 +380,75 @@ function serveBlob(req, res, { db, owner, id, version }) {
   }
 
   res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+  res.setHeader("X-Content-Type-Options", "nosniff");
   res.sendFile(path.resolve(row.blob_path));
 }
 
-function readRawBody(req) {
+const MAX_BODY_BYTES = 1024 * 1024;
+
+function readRawBody(req, maxBytes = MAX_BODY_BYTES) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    let size = 0;
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        const err = new Error("Request body too large.");
+        err.statusCode = 413;
+        reject(err);
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (req.destroyed) return;
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
     req.on("error", reject);
   });
+}
+
+function hexToBuffer(hex) {
+  if (typeof hex !== "string" || hex.length % 2 !== 0) return null;
+  return Buffer.from(hex, "hex");
+}
+
+function stateSecret(config) {
+  return (
+    config.GITHUB_CLIENT_SECRET || config.GITHUB_CLIENT_ID || "warp-registry"
+  );
+}
+
+function setStateCookie(res, state, config) {
+  const sig = crypto
+    .createHmac("sha256", stateSecret(config))
+    .update(state)
+    .digest("hex");
+  res.setHeader(
+    "Set-Cookie",
+    `warp_oauth_state=${state}.${sig}; HttpOnly; Path=/; SameSite=Lax; Max-Age=600`,
+  );
+}
+
+function verifyState(req, state, config) {
+  const header = req.headers.cookie || "";
+  for (const part of header.split(";")) {
+    const [name, value] = part.trim().split("=");
+    if (name !== "warp_oauth_state" || !value) continue;
+    const [cookieState, cookieSig] = value.split(".");
+    if (!cookieState || !cookieSig) return false;
+    if (cookieState !== state) return false;
+    const expected = crypto
+      .createHmac("sha256", stateSecret(config))
+      .update(cookieState)
+      .digest("hex");
+    const sigBuf = hexToBuffer(cookieSig);
+    const expBuf = hexToBuffer(expected);
+    if (!sigBuf || !expBuf || sigBuf.length !== expBuf.length) return false;
+    return crypto.timingSafeEqual(sigBuf, expBuf);
+  }
+  return false;
 }
 
 function escapeHtml(str) {
