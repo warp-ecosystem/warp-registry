@@ -246,9 +246,16 @@ export function createApp({ db, dataDir, config = {} }) {
 
       const stageVersion = db.transaction(() => {
         db.prepare(
-          `INSERT INTO versions (owner_id, package_id, version, status, meta_json, blob_path)
-           VALUES (?, ?, ?, 'pending', ?, ?)`,
-        ).run(owner.id, packageId, version, JSON.stringify(meta), absBlobPath);
+          `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
+           VALUES (?, ?, ?, 'staging', ?, ?, ?)`,
+        ).run(
+          owner.id,
+          packageId,
+          version,
+          status,
+          JSON.stringify(meta),
+          absBlobPath,
+        );
       });
 
       try {
@@ -359,19 +366,18 @@ const TEMP_MARKER = ".tmp-";
 export function reconcileStagedVersions(db, dataDir) {
   const staged = db
     .prepare(
-      `SELECT v.id, v.blob_path, o.has_published
-       FROM versions v JOIN owners o ON o.id = v.owner_id
-       WHERE v.status = 'pending'`,
+      `SELECT v.id, v.blob_path, v.final_status
+       FROM versions v
+       WHERE v.status = 'staging'`,
     )
     .all();
 
   for (const row of staged) {
     if (fs.existsSync(row.blob_path)) {
-      if (row.has_published === 1) {
-        db.prepare(`UPDATE versions SET status = 'published' WHERE id = ?`).run(
-          row.id,
-        );
-      }
+      db.prepare(`UPDATE versions SET status = ? WHERE id = ?`).run(
+        row.final_status,
+        row.id,
+      );
       continue;
     }
     db.prepare(`DELETE FROM versions WHERE id = ?`).run(row.id);

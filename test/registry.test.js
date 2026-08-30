@@ -7,7 +7,11 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { openDatabase, blobPath } from "../src/db.js";
-import { createApp, hashToken } from "../src/routes.js";
+import {
+  createApp,
+  hashToken,
+  reconcileStagedVersions,
+} from "../src/routes.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
@@ -280,6 +284,77 @@ describe("warp-registry publish flow", () => {
     const count = db
       .prepare(
         "SELECT COUNT(*) AS c FROM versions WHERE owner_id = (SELECT id FROM owners WHERE github_username='nestedwarpowner')",
+      )
+      .get().c;
+    assert.equal(count, 0);
+  });
+
+  test("reconcile does not publish an unapproved version when another is approved", async () => {
+    const token = insertOwner(db, "reconcileowner");
+    const a = await publish(base, token, "helloworld@0.1.0.js");
+    assert.equal(a.status, 201);
+    const bodyA = await a.json();
+    assert.equal(bodyA.status, "pending");
+
+    const b = await publishForVersion(base, token, "0.2.0");
+    assert.equal(b.status, 201);
+    const bodyB = await b.json();
+    assert.equal(bodyB.status, "pending");
+
+    approve("reconcileowner", "helloworld", "0.1.0", dataDir);
+    reconcileStagedVersions(db, dataDir);
+
+    const rows = db
+      .prepare(
+        `SELECT v.version, v.status FROM versions v
+         JOIN owners o ON o.id = v.owner_id
+         WHERE o.github_username = 'reconcileowner' ORDER BY v.version`,
+      )
+      .all();
+    assert.deepEqual(rows, [
+      { version: "0.1.0", status: "published" },
+      { version: "0.2.0", status: "pending" },
+    ]);
+  });
+
+  test("reconcile finalizes a staging row whose blob became durable", async () => {
+    const token = insertOwner(db, "stagingowner");
+    const res = await publish(base, token, "helloworld@0.1.0.js");
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.equal(body.status, "pending");
+
+    db.prepare(
+      `UPDATE versions SET status = 'staging', final_status = 'published'
+       WHERE owner_id = (SELECT id FROM owners WHERE github_username = 'stagingowner')`,
+    ).run();
+    reconcileStagedVersions(db, dataDir);
+
+    const row = db
+      .prepare(
+        `SELECT v.status FROM versions v
+         JOIN owners o ON o.id = v.owner_id
+         WHERE o.github_username = 'stagingowner'`,
+      )
+      .get();
+    assert.equal(row.status, "published");
+  });
+
+  test("reconcile deletes a staging row whose blob never became durable", async () => {
+    const token = insertOwner(db, "stagingmissingowner");
+    const res = await publish(base, token, "helloworld@0.1.0.js");
+    assert.equal(res.status, 201);
+
+    fs.rmSync(blobPath(dataDir, "stagingmissingowner", "helloworld", "0.1.0"));
+    db.prepare(
+      `UPDATE versions SET status = 'staging'
+       WHERE owner_id = (SELECT id FROM owners WHERE github_username = 'stagingmissingowner')`,
+    ).run();
+    reconcileStagedVersions(db, dataDir);
+
+    const count = db
+      .prepare(
+        "SELECT COUNT(*) AS c FROM versions WHERE owner_id = (SELECT id FROM owners WHERE github_username='stagingmissingowner')",
       )
       .get().c;
     assert.equal(count, 0);
