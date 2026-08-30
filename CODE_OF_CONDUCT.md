@@ -62,6 +62,15 @@ Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported to the community leaders responsible for enforcement. All complaints
 will be reviewed and investigated promptly and fairly.
 
+To submit a confidential complaint, email the maintainers privately at
+<conduct@warp-ecosystem.dev>. This address is monitored by the community
+leaders responsible for enforcement, and reports sent there are kept
+confidential: only the leaders investigating the report will see it. If you
+prefer, you may instead report directly to any individual community leader you
+trust via a private message. Please include as much detail as you can — what
+happened, when and where it happened, and any relevant screenshots or links —
+so the complaint can be investigated promptly and fairly.
+
 All community leaders are obligated to respect the privacy and security of the
 reporter of any incident.
 
