@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import express from "express";
 import semver from "semver";
-import { blobPath } from "./db.js";
+import { blobPath, blobsDir } from "./db.js";
 import { extractWarpMeta } from "./warp-meta.js";
 import { success, error } from "./logger.js";
 
@@ -136,7 +136,7 @@ export function createApp({ db, dataDir, config = {} }) {
     }
   });
 
-  app.post("/v1/publish", async (req, res) => {
+  app.post("/v1/publish", async (req, res, next) => {
     const authHeader = req.headers.authorization || "";
     const match = /^Bearer\s+(.+)$/i.exec(authHeader);
     if (!match) {
@@ -236,39 +236,48 @@ export function createApp({ db, dataDir, config = {} }) {
     const status = owner.has_published === 1 ? "published" : "pending";
 
     const absBlobPath = blobPath(dataDir, ownerName, packageId, version);
-
-    const insertVersion = db.transaction(() => {
-      db.prepare(
-        `INSERT INTO versions (owner_id, package_id, version, status, meta_json, blob_path)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      ).run(
-        owner.id,
-        packageId,
-        version,
-        status,
-        JSON.stringify(meta),
-        absBlobPath,
-      );
-    });
-
-    try {
-      insertVersion();
-    } catch {
-      res
-        .status(409)
-        .json({ error: "This version already exists for this owner." });
-      error("This version already exists for this owner.");
-      return;
-    }
+    const tempBlobPath = `${absBlobPath}.tmp-${crypto
+      .randomBytes(6)
+      .toString("hex")}`;
 
     try {
       fs.mkdirSync(path.dirname(absBlobPath), { recursive: true });
-      fs.writeFileSync(absBlobPath, source);
-    } catch (err) {
+      fs.writeFileSync(tempBlobPath, source);
+
+      const stageVersion = db.transaction(() => {
+        db.prepare(
+          `INSERT INTO versions (owner_id, package_id, version, status, meta_json, blob_path)
+           VALUES (?, ?, ?, 'pending', ?, ?)`,
+        ).run(owner.id, packageId, version, JSON.stringify(meta), absBlobPath);
+      });
+
+      try {
+        stageVersion();
+      } catch {
+        fs.rmSync(tempBlobPath, { force: true });
+        res
+          .status(409)
+          .json({ error: "This version already exists for this owner." });
+        error("This version already exists for this owner.");
+        return;
+      }
+
+      try {
+        fs.renameSync(tempBlobPath, absBlobPath);
+      } catch (err) {
+        db.prepare(
+          `DELETE FROM versions WHERE owner_id = ? AND package_id = ? AND version = ?`,
+        ).run(owner.id, packageId, version);
+        throw err;
+      }
+
       db.prepare(
-        `DELETE FROM versions WHERE owner_id = ? AND package_id = ? AND version = ?`,
-      ).run(owner.id, packageId, version);
-      throw err;
+        `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
+      ).run(status, owner.id, packageId, version);
+    } catch (err) {
+      fs.rmSync(tempBlobPath, { force: true });
+      next(err);
+      return;
     }
 
     res.status(201).json({
@@ -343,6 +352,61 @@ export function createApp({ db, dataDir, config = {} }) {
   });
 
   return app;
+}
+
+const TEMP_MARKER = ".tmp-";
+
+export function reconcileStagedVersions(db, dataDir) {
+  const staged = db
+    .prepare(
+      `SELECT v.id, v.blob_path, o.has_published
+       FROM versions v JOIN owners o ON o.id = v.owner_id
+       WHERE v.status = 'pending'`,
+    )
+    .all();
+
+  for (const row of staged) {
+    if (fs.existsSync(row.blob_path)) {
+      if (row.has_published === 1) {
+        db.prepare(`UPDATE versions SET status = 'published' WHERE id = ?`).run(
+          row.id,
+        );
+      }
+      continue;
+    }
+    db.prepare(`DELETE FROM versions WHERE id = ?`).run(row.id);
+  }
+
+  cleanStaleTempBlobs(db, dataDir);
+}
+
+function cleanStaleTempBlobs(db, dataDir) {
+  const blobsRoot = blobsDir(dataDir);
+  if (!fs.existsSync(blobsRoot)) return;
+  const referenced = new Set(
+    db
+      .prepare("SELECT blob_path FROM versions")
+      .all()
+      .map((row) => row.blob_path),
+  );
+  for (const file of collectFiles(blobsRoot)) {
+    const markerIndex = file.lastIndexOf(TEMP_MARKER);
+    if (markerIndex === -1) continue;
+    const finalPath = file.slice(0, markerIndex);
+    if (!referenced.has(finalPath) || !fs.existsSync(finalPath)) {
+      fs.unlinkSync(file);
+    }
+  }
+}
+
+function collectFiles(dir) {
+  const files = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...collectFiles(full));
+    else files.push(full);
+  }
+  return files;
 }
 
 function findLatest(db, owner, id) {

@@ -1,7 +1,7 @@
 import "dotenv/config";
 import path from "node:path";
 import { openDatabase } from "./db.js";
-import { createApp } from "./routes.js";
+import { createApp, reconcileStagedVersions } from "./routes.js";
 import { success } from "./logger.js";
 
 const PORT = Number(process.env.PORT || 3000);
@@ -14,6 +14,7 @@ const config = {
 };
 
 const db = openDatabase(DATA_DIR);
+reconcileStagedVersions(db, DATA_DIR);
 const app = createApp({ db, dataDir: DATA_DIR, config });
 
 app.listen(PORT, () => {
