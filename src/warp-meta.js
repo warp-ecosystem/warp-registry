@@ -3,7 +3,7 @@ import * as acorn from "acorn";
 export function extractWarpMeta(source) {
   let ast;
   try {
-    ast = acorn.parse(source, { ecmaVersion: "latest" });
+    ast = acorn.parse(source, { ecmaVersion: "latest", sourceType: "module" });
   } catch {
     return {
       ok: false,
@@ -44,17 +44,46 @@ function findTopLevelWarp(ast) {
   if (direct) return direct;
 
   for (const node of ast.body) {
-    if (
-      node.type !== "ExpressionStatement" ||
-      node.expression.type !== "CallExpression" ||
-      node.expression.callee.type !== "FunctionExpression"
-    ) {
-      continue;
-    }
-    const warp = findWarpDeclaration(node.expression.callee.body.body);
+    if (node.type !== "ExpressionStatement") continue;
+    const fn = iifeFunction(node.expression);
+    if (!fn) continue;
+    const warp = findWarpDeclaration(fn.body.body);
     if (warp) return warp;
   }
 
+  return null;
+}
+
+function iifeFunction(expression) {
+  let call = expression;
+  while (
+    call.type === "UnaryExpression" &&
+    (call.operator === "!" ||
+      call.operator === "+" ||
+      call.operator === "-" ||
+      call.operator === "~" ||
+      call.operator === "void")
+  ) {
+    call = call.argument;
+  }
+  if (call.type !== "CallExpression") return null;
+  let callee = call.callee;
+  if (
+    callee.type === "UnaryExpression" &&
+    (callee.operator === "!" ||
+      callee.operator === "+" ||
+      callee.operator === "-" ||
+      callee.operator === "~" ||
+      callee.operator === "void")
+  ) {
+    callee = callee.argument;
+  }
+  if (
+    callee.type === "FunctionExpression" ||
+    callee.type === "ArrowFunctionExpression"
+  ) {
+    return callee;
+  }
   return null;
 }
 
@@ -120,6 +149,7 @@ function extractLiteral(node) {
     case "ArrayExpression": {
       const arr = [];
       for (const el of node.elements) {
+        if (el === null) return undefined;
         const v = extractLiteral(el);
         if (v === undefined) return undefined;
         arr.push(v);
