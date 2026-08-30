@@ -23,8 +23,8 @@
   "dependencies": {
     "acorn": "^8.11.3",
     "better-sqlite3": "^13.0.3",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
     "picocolors": "^1.1.1",
     "semver": "^7.6.2"
   },
