@@ -46,7 +46,7 @@ function findTopLevelWarp(ast) {
   for (const node of ast.body) {
     if (node.type !== "ExpressionStatement") continue;
     const fn = iifeFunction(node.expression);
-    if (!fn) continue;
+    if (!fn || fn.body.type !== "BlockStatement") continue;
     const warp = findWarpDeclaration(fn.body.body);
     if (warp) return warp;
   }
@@ -89,8 +89,16 @@ function iifeFunction(expression) {
 
 function findWarpDeclaration(body) {
   for (const node of body) {
-    if (node.type !== "VariableDeclaration" || node.kind !== "const") continue;
-    for (const decl of node.declarations) {
+    const declaration =
+      node.type === "ExportNamedDeclaration" ? node.declaration : node;
+    if (
+      !declaration ||
+      declaration.type !== "VariableDeclaration" ||
+      declaration.kind !== "const"
+    ) {
+      continue;
+    }
+    for (const decl of declaration.declarations) {
       if (
         decl.id.type === "Identifier" &&
         decl.id.name === "Warp" &&
