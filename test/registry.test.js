@@ -17,6 +17,10 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
 const fixturesDir = path.join(root, "fixtures");
 
+/**
+ * Starts a test server with a temporary database.
+ * @returns {Promise<{dataDir: string, db: import('better-sqlite3').Database, server: object, base: string}>} Server context.
+ */
 async function startServer() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "warp-registry-test-"));
   const db = openDatabase(dataDir);
@@ -27,6 +31,12 @@ async function startServer() {
   return { dataDir, db, server, base: `http://127.0.0.1:${port}` };
 }
 
+/**
+ * Inserts a new owner into the database and returns a token.
+ * @param {import('better-sqlite3').Database} db - The database instance.
+ * @param {string} username - The GitHub username.
+ * @returns {string} The generated token.
+ */
 function insertOwner(db, username) {
   const token = crypto.randomBytes(32).toString("hex");
   db.prepare(
@@ -35,6 +45,14 @@ function insertOwner(db, username) {
   return token;
 }
 
+/**
+ * Publishes a fixture file to the test server.
+ * @param {string} base - The base URL of the test server.
+ * @param {string} token - The authentication token.
+ * @param {string} fixture - The fixture filename.
+ * @param {string} [contentType="application/javascript"] - The content type header.
+ * @returns {Promise<Response>} The fetch response.
+ */
 function publish(base, token, fixture, contentType = "application/javascript") {
   const body = fs.readFileSync(path.join(fixturesDir, fixture));
   return fetch(`${base}/v1/publish`, {
@@ -47,6 +65,14 @@ function publish(base, token, fixture, contentType = "application/javascript") {
   });
 }
 
+/**
+ * Runs the approve script to approve a pending package version.
+ * @param {string} username - The owner's username.
+ * @param {string} packageId - The package identifier.
+ * @param {string} version - The package version.
+ * @param {string} dataDir - The data directory path.
+ * @returns {string} The script output.
+ */
 function approve(username, packageId, version, dataDir) {
   return execFileSync(
     process.execPath,
@@ -55,6 +81,11 @@ function approve(username, packageId, version, dataDir) {
   ).toString();
 }
 
+/**
+ * Closes a test server gracefully.
+ * @param {object} server - The server instance to close.
+ * @returns {Promise<void>} Resolves when the server is closed.
+ */
 async function closeServer(server) {
   await new Promise((resolve) => server.close(resolve));
 }
@@ -361,6 +392,13 @@ describe("warp-registry publish flow", () => {
   });
 });
 
+/**
+ * Publishes a modified version of the helloworld fixture with a custom version.
+ * @param {string} base - The base URL of the test server.
+ * @param {string} token - The authentication token.
+ * @param {string} version - The version string to use.
+ * @returns {Promise<Response>} The fetch response.
+ */
 async function publishForVersion(base, token, version) {
   const body = fs
     .readFileSync(path.join(fixturesDir, "helloworld@0.1.0.js"))

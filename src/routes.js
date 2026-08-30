@@ -7,12 +7,30 @@ import { blobPath, blobsDir } from "./db.js";
 import { extractWarpMeta } from "./warp-meta.js";
 import { success, error } from "./logger.js";
 
+/**
+ * Regular expression for validating package IDs.
+ * Package IDs must start with an alphanumeric character and can contain dots, dashes, and underscores.
+ */
 export const PACKAGE_ID_RE = /^[a-z0-9](?:[a-z0-9._-]{0,63})$/;
 
+/**
+ * Computes the SHA-256 hash of a token.
+ * @param {string} token - The token to hash.
+ * @returns {string} The hex-encoded hash.
+ */
 export function hashToken(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
 
+/**
+ * Creates and configures the Express application.
+ * Sets up all routes for OAuth, publishing, and serving packages.
+ * @param {object} options - Configuration options.
+ * @param {import('better-sqlite3').Database} options.db - The database instance.
+ * @param {string} options.dataDir - The data directory path.
+ * @param {object} [options.config={}] - Optional configuration for GitHub OAuth and public URL.
+ * @returns {import('express').Express} The configured Express app.
+ */
 export function createApp({ db, dataDir, config = {} }) {
   const app = express();
   app.use(express.json());
@@ -361,8 +379,17 @@ export function createApp({ db, dataDir, config = {} }) {
   return app;
 }
 
+/**
+ * Marker string used in temporary blob file names.
+ */
 const TEMP_MARKER = ".tmp-";
 
+/**
+ * Reconciles staged versions on startup, promoting or deleting them based on blob existence.
+ * Cleans up stale temporary blob files.
+ * @param {import('better-sqlite3').Database} db - The database instance.
+ * @param {string} dataDir - The data directory path.
+ */
 export function reconcileStagedVersions(db, dataDir) {
   const staged = db
     .prepare(
@@ -386,6 +413,12 @@ export function reconcileStagedVersions(db, dataDir) {
   cleanStaleTempBlobs(db, dataDir);
 }
 
+/**
+ * Cleans up stale temporary blob files that are no longer needed.
+ * Removes temp files if their final versions don't exist or are not referenced.
+ * @param {import('better-sqlite3').Database} db - The database instance.
+ * @param {string} dataDir - The data directory path.
+ */
 function cleanStaleTempBlobs(db, dataDir) {
   const blobsRoot = blobsDir(dataDir);
   if (!fs.existsSync(blobsRoot)) return;
@@ -405,6 +438,11 @@ function cleanStaleTempBlobs(db, dataDir) {
   }
 }
 
+/**
+ * Recursively collects all file paths in a directory.
+ * @param {string} dir - The directory to traverse.
+ * @returns {string[]} Array of absolute file paths.
+ */
 function collectFiles(dir) {
   const files = [];
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -415,6 +453,13 @@ function collectFiles(dir) {
   return files;
 }
 
+/**
+ * Finds the latest published version of a package.
+ * @param {import('better-sqlite3').Database} db - The database instance.
+ * @param {string} owner - The package owner's username.
+ * @param {string} id - The package identifier.
+ * @returns {object|null} The latest version row, or null if no published versions exist.
+ */
 function findLatest(db, owner, id) {
   const rows = db
     .prepare(
@@ -429,6 +474,16 @@ function findLatest(db, owner, id) {
   return rows[0];
 }
 
+/**
+ * Serves a package version blob file as JavaScript.
+ * @param {import('express').Request} req - The Express request object.
+ * @param {import('express').Response} res - The Express response object.
+ * @param {object} options - Options for serving the blob.
+ * @param {import('better-sqlite3').Database} options.db - The database instance.
+ * @param {string} options.owner - The package owner's username.
+ * @param {string} options.id - The package identifier.
+ * @param {string} options.version - The package version.
+ */
 function serveBlob(req, res, { db, owner, id, version }) {
   const row = db
     .prepare(
@@ -454,8 +509,18 @@ function serveBlob(req, res, { db, owner, id, version }) {
   res.sendFile(path.resolve(row.blob_path));
 }
 
+/**
+ * Maximum allowed request body size in bytes (1MB).
+ */
 const MAX_BODY_BYTES = 1024 * 1024;
 
+/**
+ * Reads the raw body of a request as a UTF-8 string.
+ * Enforces a maximum body size to prevent memory exhaustion.
+ * @param {import('express').Request} req - The Express request object.
+ * @param {number} [maxBytes=MAX_BODY_BYTES] - Maximum allowed body size in bytes.
+ * @returns {Promise<string>} The request body as a string.
+ */
 function readRawBody(req, maxBytes = MAX_BODY_BYTES) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -479,17 +544,34 @@ function readRawBody(req, maxBytes = MAX_BODY_BYTES) {
   });
 }
 
+/**
+ * Converts a hex string to a Buffer.
+ * @param {string} hex - The hex string to convert.
+ * @returns {Buffer|null} The Buffer, or null if the hex string is invalid.
+ */
 function hexToBuffer(hex) {
   if (typeof hex !== "string" || hex.length % 2 !== 0) return null;
   return Buffer.from(hex, "hex");
 }
 
+/**
+ * Returns the secret used for signing OAuth state cookies.
+ * Falls back to client ID or a default if client secret is not configured.
+ * @param {object} config - The configuration object.
+ * @returns {string} The state secret.
+ */
 function stateSecret(config) {
   return (
     config.GITHUB_CLIENT_SECRET || config.GITHUB_CLIENT_ID || "warp-registry"
   );
 }
 
+/**
+ * Sets an HttpOnly cookie containing the signed OAuth state.
+ * @param {import('express').Response} res - The Express response object.
+ * @param {string} state - The state value to sign and store.
+ * @param {object} config - The configuration object.
+ */
 function setStateCookie(res, state, config) {
   const sig = crypto
     .createHmac("sha256", stateSecret(config))
@@ -501,6 +583,14 @@ function setStateCookie(res, state, config) {
   );
 }
 
+/**
+ * Verifies the OAuth state cookie matches the provided state value.
+ * Uses timing-safe comparison to prevent timing attacks.
+ * @param {import('express').Request} req - The Express request object.
+ * @param {string} state - The state value to verify.
+ * @param {object} config - The configuration object.
+ * @returns {boolean} True if the state is valid, false otherwise.
+ */
 function verifyState(req, state, config) {
   const header = req.headers.cookie || "";
   for (const part of header.split(";")) {
@@ -521,6 +611,11 @@ function verifyState(req, state, config) {
   return false;
 }
 
+/**
+ * Escapes HTML special characters to prevent XSS attacks.
+ * @param {string} str - The string to escape.
+ * @returns {string} The escaped string.
+ */
 function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => {
     switch (c) {
