@@ -127,3 +127,7 @@ curl http://localhost:3000/v1/your-gh-username/helloworld/0.1.0
 ```
 
 The latter serves the same `application/javascript` blob you uploaded. (`/v1/your-gh-username/helloworld/latest` works too.)
+
+## 9. Load it into TurboWarp
+
+Now you can load the example extension you published into TurboWarp. You can load it from the URL: `http://localhost:3000/v1/your-gh-username/helloworld/0.1.0`.
