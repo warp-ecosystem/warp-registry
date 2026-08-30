@@ -40,42 +40,39 @@ export function extractWarpMeta(source) {
 }
 
 function findTopLevelWarp(ast) {
-  const result = { found: null };
-  const visit = (node) => {
-    if (result.found || !node || typeof node.type !== "string") return;
-    if (node.type === "VariableDeclaration" && node.kind === "const") {
-      for (const decl of node.declarations) {
-        if (
-          decl.id.type === "Identifier" &&
-          decl.id.name === "Warp" &&
-          decl.init &&
-          decl.init.type === "ObjectExpression"
-        ) {
-          result.found = decl.init;
-          return;
-        }
-      }
+  const direct = findWarpDeclaration(ast.body);
+  if (direct) return direct;
+
+  for (const node of ast.body) {
+    if (
+      node.type !== "ExpressionStatement" ||
+      node.expression.type !== "CallExpression" ||
+      node.expression.callee.type !== "FunctionExpression"
+    ) {
+      continue;
     }
-    for (const key of Object.keys(node)) {
+    const warp = findWarpDeclaration(node.expression.callee.body.body);
+    if (warp) return warp;
+  }
+
+  return null;
+}
+
+function findWarpDeclaration(body) {
+  for (const node of body) {
+    if (node.type !== "VariableDeclaration" || node.kind !== "const") continue;
+    for (const decl of node.declarations) {
       if (
-        key === "start" ||
-        key === "end" ||
-        key === "loc" ||
-        key === "range"
+        decl.id.type === "Identifier" &&
+        decl.id.name === "Warp" &&
+        decl.init &&
+        decl.init.type === "ObjectExpression"
       ) {
-        continue;
+        return decl.init;
       }
-      const child = node[key];
-      if (Array.isArray(child)) {
-        for (const item of child) visit(item);
-      } else if (child && typeof child.type === "string") {
-        visit(child);
-      }
-      if (result.found) return;
     }
-  };
-  visit(ast);
-  return result.found;
+  }
+  return null;
 }
 
 function findProperty(objectNode, name) {

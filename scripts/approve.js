@@ -2,6 +2,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { openDatabase } from "../src/db.js";
+import { success, error } from "../src/logger.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
@@ -10,7 +11,7 @@ const DEFAULT_DATA_DIR = path.join(root, "data");
 const [, , username, packageId, version] = process.argv;
 
 if (!username || !packageId || !version) {
-  console.error(
+  error(
     "Usage: node scripts/approve.js <github_username> <package_id> <version>",
   );
   process.exit(1);
@@ -24,7 +25,7 @@ const owner = db
   .get(username);
 
 if (!owner) {
-  console.error(`Owner not found: ${username}`);
+  error(`Owner not found: ${username}`);
   process.exit(1);
 }
 
@@ -36,12 +37,12 @@ const result = db
   .run(owner.id, packageId, version);
 
 if (result.changes === 0) {
-  console.error(`No version found for ${username}/${packageId}@${version}`);
+  error(`No version found for ${username}/${packageId}@${version}`);
   process.exit(1);
 }
 
 db.prepare("UPDATE owners SET has_published = 1 WHERE id = ?").run(owner.id);
 
-console.log(
+success(
   `Approved ${username}/${packageId}@${version} (owner now has_published=1)`,
 );

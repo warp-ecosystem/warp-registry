@@ -5,6 +5,7 @@ import express from "express";
 import semver from "semver";
 import { blobPath } from "./db.js";
 import { extractWarpMeta } from "./warp-meta.js";
+import { success, error } from "./logger.js";
 
 export const PACKAGE_ID_RE = /^[a-z0-9](?:[a-z0-9._-]{0,63})$/;
 
@@ -111,6 +112,8 @@ export function createApp({ db, dataDir, config = {} }) {
          ON CONFLICT(github_username) DO UPDATE SET token_hash = excluded.token_hash`,
       ).run(username, tokenHash);
 
+      success(`OAuth token issued for ${username}`);
+
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       res.status(200).send(`<!doctype html>
 <html lang="en">
@@ -147,6 +150,7 @@ export function createApp({ db, dataDir, config = {} }) {
       .get(tokenHash);
     if (!owner) {
       res.status(401).json({ error: "Invalid token." });
+      error("Invalid token.");
       return;
     }
 
@@ -163,9 +167,10 @@ export function createApp({ db, dataDir, config = {} }) {
 
     const source = await readRawBody(req);
 
-    const { ok, meta, error } = extractWarpMeta(source);
+    const { ok, meta, error: metaError } = extractWarpMeta(source);
     if (!ok) {
-      res.status(400).json({ error });
+      res.status(400).json({ error: metaError });
+      error(metaError);
       return;
     }
 
@@ -176,11 +181,11 @@ export function createApp({ db, dataDir, config = {} }) {
       });
       return;
     }
-    if (typeof meta.version !== "string" || !PACKAGE_ID_RE.test(meta.version)) {
+    if (typeof meta.version !== "string" || semver.valid(meta.version) === null) {
       res.status(400).json({
-        error:
-          "meta.version is required and must match ^[a-z0-9](?:[a-z0-9._-]{0,63})$.",
+        error: "meta.version must be a valid semver string.",
       });
+      error("meta.version must be a valid semver string.");
       return;
     }
     for (const field of ["name", "license", "description"]) {
@@ -205,6 +210,7 @@ export function createApp({ db, dataDir, config = {} }) {
       res
         .status(409)
         .json({ error: "This version already exists for this owner." });
+      error("This version already exists for this owner.");
       return;
     }
 
@@ -233,6 +239,8 @@ export function createApp({ db, dataDir, config = {} }) {
       status,
       url: `/v1/${ownerName}/${packageId}/${version}`,
     });
+
+    success(`${ownerName}/${packageId}@${version} (${status})`);
   });
 
   app.get("/v1/:owner/:id", (req, res) => {
@@ -263,11 +271,6 @@ export function createApp({ db, dataDir, config = {} }) {
       meta: JSON.parse(latest.meta_json),
       versions: rows.map((r) => r.version),
     });
-  });
-
-  app.get("/v1/:owner/:id/version/:version", (req, res) => {
-    const { owner, id, version } = req.params;
-    serveBlob(req, res, { db, dataDir, owner, id, version });
   });
 
   app.get("/v1/:owner/:id/:version", (req, res) => {

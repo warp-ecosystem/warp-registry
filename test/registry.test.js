@@ -204,6 +204,54 @@ describe("warp-registry publish flow", () => {
     );
     assert.equal(res.status, 401);
   });
+
+  test("non-semver meta.version is rejected with 400 and never persisted", async () => {
+    const token = insertOwner(db, "badversionowner");
+    const body = fs
+      .readFileSync(path.join(fixturesDir, "helloworld@0.1.0.js"))
+      .toString()
+      .replace('version: "0.1.0"', 'version: "not-a-version"');
+    const res = await fetch(`${base}/v1/publish`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/javascript",
+        Authorization: `Bearer ${token}`,
+      },
+      body,
+    });
+    assert.equal(res.status, 400);
+    const parsed = await res.json();
+    assert.match(parsed.error, /valid semver/i);
+
+    const count = db
+      .prepare(
+        "SELECT COUNT(*) AS c FROM versions WHERE owner_id = (SELECT id FROM owners WHERE github_username='badversionowner')",
+      )
+      .get().c;
+    assert.equal(count, 0);
+    assert.equal(
+      fs.existsSync(
+        blobPath(dataDir, "badversionowner", "helloworld", "not-a-version"),
+      ),
+      false,
+      "blob must not be written to disk for an invalid version",
+    );
+  });
+
+  test("nested Warp declaration inside a function is rejected with 400", async () => {
+    const token = insertOwner(db, "nestedwarpowner");
+    const res = await publish(base, token, "nested-warp.js");
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.match(body.error, /No\s+`const Warp`\s+object declaration found/i);
+
+    const count = db
+      .prepare(
+        "SELECT COUNT(*) AS c FROM versions WHERE owner_id = (SELECT id FROM owners WHERE github_username='nestedwarpowner')",
+      )
+      .get().c;
+    assert.equal(count, 0);
+  });
 });
 
 async function publishForVersion(base, token, version) {
