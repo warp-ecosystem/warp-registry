@@ -5,6 +5,9 @@
   "type": "module",
   "description": "Warp Registry — A Node registry of extensions created with Warp Compiler.",
   "main": "src/server.js",
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || >=24"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/warp-ecosystem/warp-registry.git"
