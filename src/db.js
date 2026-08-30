@@ -32,16 +32,23 @@ function migrateSchema(db) {
     .get();
   if (versions && /final_status/.test(versions.sql)) return;
 
-  db.exec("ALTER TABLE versions RENAME TO versions_old");
-  db.exec(SCHEMA);
-  db.exec(
-    `INSERT INTO versions (id, owner_id, package_id, version, status, final_status, meta_json, blob_path, created_at)
-     SELECT id, owner_id, package_id, version, status,
-            CASE WHEN status = 'published' THEN 'published' ELSE 'pending' END,
-            meta_json, blob_path, created_at
-     FROM versions_old`,
-  );
-  db.exec("DROP TABLE versions_old");
+  db.exec("BEGIN");
+  try {
+    db.exec("ALTER TABLE versions RENAME TO versions_old");
+    db.exec(SCHEMA);
+    db.exec(
+      `INSERT INTO versions (id, owner_id, package_id, version, status, final_status, meta_json, blob_path, created_at)
+       SELECT id, owner_id, package_id, version, status,
+              CASE WHEN status = 'published' THEN 'published' ELSE 'pending' END,
+              meta_json, blob_path, created_at
+       FROM versions_old`,
+    );
+    db.exec("DROP TABLE versions_old");
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
 }
 
 export function openDatabase(dataDir) {
