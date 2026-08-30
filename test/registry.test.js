@@ -146,13 +146,14 @@ describe("warp-registry publish flow", () => {
     const statuses = [a.status, b.status].sort();
     assert.deepEqual(statuses, [201, 409]);
 
-    const row = db
+    const rows = db
       .prepare(
         `SELECT v.* FROM versions v JOIN owners o ON o.id = v.owner_id
          WHERE o.github_username = 'concurrentowner'`,
       )
-      .get();
-    assert.ok(row, "exactly one persisted version row");
+      .all();
+    assert.equal(rows.length, 1, "exactly one persisted version row");
+    const row = rows[0];
     assert.ok(fs.existsSync(row.blob_path), "blob must exist on disk");
 
     const storedMeta = JSON.parse(row.meta_json);
