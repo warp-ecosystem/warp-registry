@@ -2,6 +2,9 @@ name: CI
 
 on:
   pull_request:
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -17,6 +20,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -32,12 +37,17 @@ jobs:
       - name: Check Prettier formatting
         run: npm run format:check
 
+      - name: Run tests
+        run: npm test
+
   dockerfile:
     name: Lint Dockerfile (hadolint)
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Run hadolint
         uses: hadolint/hadolint-action@v3.5.0
