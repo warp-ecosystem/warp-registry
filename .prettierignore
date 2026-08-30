@@ -1,0 +1,6 @@
+node_modules/
+data/
+fixtures/
+package-lock.json
+.env
+.env.*

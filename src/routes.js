@@ -320,7 +320,7 @@ function findLatest(db, owner, id) {
   return rows[0];
 }
 
-function serveBlob(req, res, { db, dataDir, owner, id, version }) {
+function serveBlob(req, res, { db, owner, id, version }) {
   const row = db
     .prepare(
       `SELECT v.blob_path, v.status, v.version

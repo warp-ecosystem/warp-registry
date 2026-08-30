@@ -1,0 +1,14 @@
+services:
+  warp-registry:
+    image: ghcr.io/warp-ecosystem/warp-registry:latest
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - PORT=3000
+      - DATA_DIR=/app/data
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+    volumes:
+      - ./data:/app/data

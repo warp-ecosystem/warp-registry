@@ -1,0 +1,9 @@
+# hadolint configuration
+# https://github.com/hadolint/hadolint#configure
+
+ignored:
+  # Build-only deps (python3/make/g++) used to compile native modules in the
+  # build stage; not shipped in the final image, so no pinning needed.
+  - DL3018
+  # Run as the non-root `node` user by name; numeric UID is fine for our use.
+  - DL3066

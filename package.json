@@ -5,10 +5,17 @@
   "type": "module",
   "description": "Warp Registry — A Node registry of extensions created with Warp Compiler.",
   "main": "src/server.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/warp-ecosystem/warp-registry.git"
+  },
   "scripts": {
     "start": "node src/server.js",
     "dev": "node src/server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "dependencies": {
     "acorn": "^8.11.3",
@@ -17,5 +24,12 @@
     "express": "^4.19.2",
     "picocolors": "^1.1.1",
     "semver": "^7.6.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.9.1",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.11.0",
+    "prettier": "^3.9.6"
   }
 }
