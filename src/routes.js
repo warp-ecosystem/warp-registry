@@ -181,7 +181,10 @@ export function createApp({ db, dataDir, config = {} }) {
       });
       return;
     }
-    if (typeof meta.version !== "string" || semver.valid(meta.version) === null) {
+    if (
+      typeof meta.version !== "string" ||
+      semver.valid(meta.version) === null
+    ) {
       res.status(400).json({
         error: "meta.version must be a valid semver string.",
       });
