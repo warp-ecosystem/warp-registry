@@ -162,6 +162,7 @@ export function createApp({ db, dataDir, config = {} }) {
       res.status(400).json({
         error: "Content-Type must be application/javascript or text/plain.",
       });
+      error("Content-Type must be application/javascript or text/plain.");
       return;
     }
 
@@ -179,6 +180,9 @@ export function createApp({ db, dataDir, config = {} }) {
         error:
           "meta.id is required and must match ^[a-z0-9](?:[a-z0-9._-]{0,63})$.",
       });
+      error(
+        "meta.id is required and must match ^[a-z0-9](?:[a-z0-9._-]{0,63})$.",
+      );
       return;
     }
     if (
@@ -196,6 +200,7 @@ export function createApp({ db, dataDir, config = {} }) {
         res.status(400).json({
           error: `meta.${field} is required and must be a non-empty string.`,
         });
+        error(`meta.${field} is required and must be a non-empty string.`);
         return;
       }
     }
