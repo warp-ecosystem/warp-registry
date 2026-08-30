@@ -4,7 +4,7 @@ A walkthrough for running Warp Registry yourself for the first time.
 
 ## 1. Prerequisites
 
-- **Node.js.** `package.json` does not declare an `engines` field, so there is no declared minimum. This project was built and tested against **Node.js v24.14.0** (npm 11.9.0). It relies on built-in `fetch` and the `node --test` runner, so use Node 18 or newer.
+- **Node.js.** `package.json` declares an `engines` field of `^20.19.0 || ^22.13.0 || >=24`. This project was built and tested against **Node.js v24.14.0** (npm 11.9.0). It relies on built-in `fetch` and the `node --test` runner.
 
 ## 2. Install
 
@@ -29,7 +29,7 @@ Warp Registry uses GitHub OAuth to hand out publish tokens, so you need an OAuth
 1. Go to <https://github.com/settings/developers>.
 2. Click **New OAuth App**.
 3. Fill in an **Application name** and **Homepage URL**.
-4. Set the **Authorization callback URL** to `http://<host>:<port>/callback`, where `<host>:<port>` matches where the server will actually run — and critically, **it must match the `PORT` value in your `.env`**. For example, with `PORT=3000` on your own machine, the callback URL is `http://localhost:3000/callback`. If these don't match, the `/login` flow will fail.
+4. Set the **Authorization callback URL** to `http://<host>:<port>/callback` for strictly local development, where `<host>:<port>` matches where the server will actually run — and critically, **it must match the `PORT` value in your `.env`**. For example, with `PORT=3000` on your own machine, the callback URL is `http://localhost:3000/callback`. Use HTTP only for `localhost` or other strictly local development. Whenever the server is shared, remotely reachable, or publicly deployed, use an **HTTPS** callback URL (for example `https://registry.example.com/callback`). If these don't match, the `/login` flow will fail.
 5. Click **Register application**.
 6. GitHub now shows a **Client ID** and a **Client Secret**.
 
@@ -39,8 +39,11 @@ Put those values in `.env`:
 PORT=3000
 GITHUB_CLIENT_ID=your_client_id
 GITHUB_CLIENT_SECRET=your_client_secret
+PUBLIC_BASE_URL=https://registry.example.com
 DATA_DIR=./data
 ```
+
+`PUBLIC_BASE_URL` is optional. When running behind a reverse proxy or a publicly deployed server, set it to the canonical base URL of your deployment (scheme and host, no trailing `/`) — for example `https://registry.example.com`. The registry then builds the OAuth redirect to `${PUBLIC_BASE_URL}/callback` instead of deriving it from the incoming request, so the value must match the **Authorization callback URL** you registered with GitHub above. For plain `http://localhost` development you can leave it empty and the redirect is derived automatically.
 
 ## 4. Start the server
 
@@ -50,7 +53,7 @@ npm start
 
 A successful startup looks like a green check-marked line:
 
-```
+```text
 ✓ Warp Registry listening on http://localhost:3000
 ```
 
