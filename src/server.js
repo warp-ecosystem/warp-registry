@@ -8,6 +8,10 @@ const PORT = Number(process.env.PORT || 3000);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || "./data");
 const DEFAULT_SHUTDOWN_TIMEOUT = 5000;
 const MAX_SHUTDOWN_TIMEOUT = 9000;
+/**
+ * Determines the shutdown timeout from the environment configuration.
+ * @return {number} The configured timeout in milliseconds when valid; otherwise, the default shutdown timeout.
+ */
 function resolveShutdownTimeout() {
   const value = Number(
     process.env.SHUTDOWN_TIMEOUT || DEFAULT_SHUTDOWN_TIMEOUT,
@@ -35,6 +39,10 @@ const server = app.listen(PORT, () => {
 
 let shuttingDown = false;
 
+/**
+ * Gracefully shuts down the server and database in response to a process signal.
+ * @param {string} signal - The signal that initiated shutdown.
+ */
 function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
