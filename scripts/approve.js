@@ -40,6 +40,12 @@ const approve = db.transaction(() => {
   if (result.changes === 0) return false;
 
   db.prepare("UPDATE owners SET has_published = 1 WHERE id = ?").run(owner.id);
+
+  db.prepare(
+    `DELETE FROM versions
+     WHERE owner_id = ?
+       AND status IN ('staging', 'pending')`,
+  ).run(owner.id);
   return true;
 });
 

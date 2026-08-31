@@ -48,10 +48,26 @@ const semverSortKeyRegistered = new WeakSet();
  * Detects a violation of the partial unique index that allows at most one
  * staging or pending version per owner, distinguishing it from the per-version
  * uniqueness constraint.
+ * Determines whether the owner has a staging or pending row by querying the
+ * database state before classifying the conflict. The pending classification
+ * is returned only when that row confirms it; the error-message check is kept
+ * solely as a fallback when the state query cannot determine the result.
  * @param {unknown} err - The error thrown by better-sqlite3.
+ * @param {import('better-sqlite3').Database} db - The database instance.
+ * @param {number} ownerId - The id of the owner performing the publish.
  * @returns {boolean} True if the error is the one-pending-per-owner violation.
  */
-function isPendingConflict(err) {
+function isPendingConflict(err, db, ownerId) {
+  if (
+    db
+      .prepare(
+        `SELECT 1 FROM versions
+         WHERE owner_id = ? AND status IN ('staging', 'pending')`,
+      )
+      .get(ownerId)
+  ) {
+    return true;
+  }
   return (
     err?.code === "SQLITE_CONSTRAINT_UNIQUE" &&
     typeof err.message === "string" &&
@@ -324,29 +340,31 @@ export function createApp({ db, dataDir, config = {} }) {
           ).run(status, owner.id, packageId, version);
         })();
       } else {
-        const staged = db.transaction(() => {
-          if (
-            db
-              .prepare(
-                `SELECT id FROM versions WHERE owner_id = ? AND status = 'pending'`,
-              )
-              .get(owner.id)
-          ) {
-            return null;
-          }
-          db.prepare(
-            `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
+        const staged = db
+          .transaction(() => {
+            if (
+              db
+                .prepare(
+                  `SELECT id FROM versions WHERE owner_id = ? AND status = 'pending'`,
+                )
+                .get(owner.id)
+            ) {
+              return null;
+            }
+            db.prepare(
+              `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
              VALUES (?, ?, ?, 'staging', ?, ?, ?)`,
-          ).run(
-            owner.id,
-            packageId,
-            version,
-            status,
-            JSON.stringify(meta),
-            absBlobPath,
-          );
-          return true;
-        })();
+            ).run(
+              owner.id,
+              packageId,
+              version,
+              status,
+              JSON.stringify(meta),
+              absBlobPath,
+            );
+            return true;
+          })
+          .immediate();
 
         if (!staged) {
           fs.rmSync(tempBlobPath, { force: true });
@@ -376,7 +394,7 @@ export function createApp({ db, dataDir, config = {} }) {
     } catch (err) {
       fs.rmSync(tempBlobPath, { force: true });
       if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
-        if (isPendingConflict(err)) {
+        if (isPendingConflict(err, db, owner.id)) {
           res.status(409).json({
             error:
               "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
@@ -437,12 +455,15 @@ export function createApp({ db, dataDir, config = {} }) {
         `SELECT owner, id, meta_json, latestVersion
          FROM (${latestPublishedSelections}) t
          WHERE t.rn = 1
-           AND (t.meta_json LIKE ? ESCAPE '\\'
+           AND (json_extract(t.meta_json, '$.name') LIKE ? ESCAPE '\\'
+             OR json_extract(t.meta_json, '$.version') LIKE ? ESCAPE '\\'
+             OR json_extract(t.meta_json, '$.license') LIKE ? ESCAPE '\\'
+             OR json_extract(t.meta_json, '$.description') LIKE ? ESCAPE '\\'
              OR t.id LIKE ? ESCAPE '\\'
              OR t.owner LIKE ? ESCAPE '\\')
          LIMIT 10`,
       )
-      .all(pattern, pattern, pattern);
+      .all(pattern, pattern, pattern, pattern, pattern, pattern);
     res.json({
       results: rows.map((r) => {
         const meta = JSON.parse(r.meta_json);
