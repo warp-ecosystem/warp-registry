@@ -7,11 +7,12 @@ import { success, warn } from "./logger.js";
 const PORT = Number(process.env.PORT || 3000);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || "./data");
 const DEFAULT_SHUTDOWN_TIMEOUT = 5000;
+const MAX_SHUTDOWN_TIMEOUT = 9000;
 function resolveShutdownTimeout() {
   const value = Number(
     process.env.SHUTDOWN_TIMEOUT || DEFAULT_SHUTDOWN_TIMEOUT,
   );
-  if (!Number.isFinite(value) || value < 1 || value > 2147483647) {
+  if (!Number.isFinite(value) || value < 1 || value > MAX_SHUTDOWN_TIMEOUT) {
     return DEFAULT_SHUTDOWN_TIMEOUT;
   }
   return value;
