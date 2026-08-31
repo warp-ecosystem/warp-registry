@@ -737,6 +737,17 @@ describe("warp-registry search endpoint", () => {
       }),
     );
 
+    const longSToken = insertApprovedOwner(db, "longsowner");
+    await publishRaw(
+      base,
+      longSToken,
+      buildCustomBody({
+        id: "longspkg",
+        name: "Ma\u017Fs",
+        description: "Latin long s package",
+      }),
+    );
+
     const pendingToken = insertOwner(db, "pendingsearch");
     await publishRaw(
       base,
@@ -819,6 +830,30 @@ describe("warp-registry search endpoint", () => {
       directBody.results.map((r) => r.id),
       ["sharppkg"],
       "Straße should match Straße",
+    );
+  });
+
+  test("search matches names containing U+017F (long s) via full case folding", async () => {
+    const stdForm = await fetch(
+      `${base}/v1/search?q=${encodeURIComponent("mass")}`,
+    );
+    assert.equal(stdForm.status, 200);
+    const stdBody = await stdForm.json();
+    assert.deepEqual(
+      stdBody.results.map((r) => r.id),
+      ["longspkg"],
+      "mass should match Ma\u017Fs (long s folds to s)",
+    );
+
+    const direct = await fetch(
+      `${base}/v1/search?q=${encodeURIComponent("Ma\u017Fs")}`,
+    );
+    assert.equal(direct.status, 200);
+    const directBody = await direct.json();
+    assert.deepEqual(
+      directBody.results.map((r) => r.id),
+      ["longspkg"],
+      "Ma\u017Fs should match itself",
     );
   });
 

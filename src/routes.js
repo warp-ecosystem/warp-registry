@@ -45,21 +45,35 @@ export function semverSortKey(version) {
 const semverSortKeyRegistered = new WeakSet();
 
 /**
- * Full Unicode case-folding multi-character expansions from Unicode 16.0
- * CaseFolding.txt (status C + F). Characters not listed here are folded by
- * {@link String.prototype.toLowerCase}. Each entry maps a code point to the
- * string it expands to under full case folding.
+ * Unicode case-folding table derived from Unicode 16.0 CaseFolding.txt (status
+ * C + F). Contains multi-character expansions (F entries) and common (C)
+ * entries where the case-folded form differs from
+ * {@link String.prototype.toLowerCase}. Characters not listed here are folded
+ * by `toLowerCase`.
  *
  * @see https://www.unicode.org/Public/16.0.0/ucd/CaseFolding.txt
  */
 const FULL_CASE_FOLD = new Map([
+  [0x00b5, "\u03BC"],
   [0x00df, "\u0073\u0073"],
   [0x0130, "\u0069\u0307"],
   [0x0149, "\u02BC\u006E"],
+  [0x017f, "\u0073"],
   [0x01f0, "\u006A\u030C"],
+  [0x0345, "\u03B9"],
   [0x0390, "\u03B9\u0308\u0301"],
   [0x03b0, "\u03C5\u0308\u0301"],
+  [0x03c2, "\u03C3"],
   [0x0587, "\u0565\u0582"],
+  [0x1c80, "\u0432"],
+  [0x1c81, "\u0434"],
+  [0x1c82, "\u043E"],
+  [0x1c83, "\u0441"],
+  [0x1c84, "\u0442"],
+  [0x1c85, "\u0442"],
+  [0x1c86, "\u044A"],
+  [0x1c87, "\u0463"],
+  [0x1c88, "\uA64B"],
   [0x1e96, "\u0068\u0331"],
   [0x1e97, "\u0074\u0308"],
   [0x1e98, "\u0077\u030A"],
@@ -162,9 +176,10 @@ const FULL_CASE_FOLD = new Map([
 /**
  * Case-folds a string using the full Unicode case mapping (not just ASCII).
  * SQLite's built-in LIKE and lower() only fold ASCII (A-Z/a-z), so this is
- * used for name matching to support non-ASCII case-insensitivity (e.g. ß/SS).
- * Multi-character expansions from Unicode CaseFolding.txt are applied so that
- * e.g. "Straße" and "STRASSE" fold to the same string.
+ * used for name matching to support non-ASCII case-insensitivity. Applies both
+ * multi-character expansions (e.g. ß/SS) and single-code-point folds where
+ * Unicode case folding differs from {@link String.prototype.toLowerCase}
+ * (e.g. U+017F ſ → "s").
  * @param {unknown} value - The value to fold.
  * @returns {string} The case-folded string, or an empty string for NULL.
  */
