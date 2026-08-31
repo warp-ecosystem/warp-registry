@@ -340,7 +340,11 @@ export function createApp({ db, dataDir, config = {} }) {
            v.created_at AS created_at,
            ROW_NUMBER() OVER (
              PARTITION BY v.owner_id, v.package_id
-             ORDER BY v.created_at DESC, v.id DESC
+             ORDER BY
+               CAST(SUBSTR(v.version, 1, INSTR(v.version, '.') - 1) AS INTEGER) DESC,
+               CAST(SUBSTR(SUBSTR(v.version, INSTR(v.version, '.') + 1), 1, INSTR(SUBSTR(v.version, INSTR(v.version, '.') + 1), '.') - 1) AS INTEGER) DESC,
+               CAST(SUBSTR(SUBSTR(v.version, INSTR(v.version, '.') + 1), INSTR(SUBSTR(v.version, INSTR(v.version, '.') + 1), '.') + 1) AS INTEGER) DESC,
+               v.created_at DESC, v.id DESC
            ) AS rn
     FROM versions v
     JOIN owners o ON o.id = v.owner_id
@@ -382,7 +386,11 @@ export function createApp({ db, dataDir, config = {} }) {
     let limit = 20;
     if (req.query.limit !== undefined) {
       const parsed = Number(req.query.limit);
-      if (Number.isFinite(parsed) && parsed >= 0) limit = parsed;
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        res.status(400).json({ error: "limit must be a positive integer." });
+        return;
+      }
+      limit = parsed;
     }
     limit = Math.min(limit, 50);
 

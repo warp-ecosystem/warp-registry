@@ -583,6 +583,40 @@ describe("warp-registry search endpoint", () => {
     assert.equal(body.results[0].id, "mypkg");
     assert.equal(body.results[0].latestVersion, "0.2.0");
   });
+
+  test("discovery picks latestVersion by semantic version, not publication order", async () => {
+    const token = insertApprovedOwner(db, "backportowner");
+    const publishVersion = async (version) => {
+      const res = await publishRaw(
+        base,
+        token,
+        buildCustomBody({ id: "backportpkg", version }),
+      );
+      assert.equal(res.status, 201);
+    };
+
+    await publishVersion("2.0.0");
+    await publishVersion("1.5.1");
+
+    const searchRes = await fetch(`${base}/v1/search?q=backportpkg`);
+    assert.equal(searchRes.status, 200);
+    const searchBody = await searchRes.json();
+    assert.equal(searchBody.results.length, 1);
+    assert.equal(
+      searchBody.results[0].latestVersion,
+      "2.0.0",
+      "lower version published later must not supersede the higher version",
+    );
+
+    const infoRes = await fetch(`${base}/v1/backportowner/backportpkg`);
+    assert.equal(infoRes.status, 200);
+    const info = await infoRes.json();
+    assert.equal(
+      info.latestVersion,
+      "2.0.0",
+      "GET /v1/:owner/:id stays consistent with discovery",
+    );
+  });
 });
 
 describe("warp-registry packages pagination", () => {
@@ -698,6 +732,20 @@ describe("warp-registry packages pagination: limit and cursor validation", () =>
     const body = await res.json();
     assert.equal(body.packages.length, 50);
     assert.ok(body.nextCursor, "a nextCursor should remain after clamping");
+  });
+
+  test("non-positive or non-integer limit returns 400", async () => {
+    const zero = await fetch(`${base}/v1/packages?limit=0`);
+    assert.equal(zero.status, 400);
+
+    const negative = await fetch(`${base}/v1/packages?limit=-5`);
+    assert.equal(negative.status, 400);
+
+    const nonInteger = await fetch(`${base}/v1/packages?limit=2.5`);
+    assert.equal(nonInteger.status, 400);
+
+    const notANumber = await fetch(`${base}/v1/packages?limit=abc`);
+    assert.equal(notANumber.status, 400);
   });
 
   test("invalid cursor returns 400", async () => {
