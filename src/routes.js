@@ -310,19 +310,34 @@ export function createApp({ db, dataDir, config = {} }) {
       return;
     }
 
-    const status = owner.has_published === 1 ? "published" : "pending";
-
     const absBlobPath = blobPath(dataDir, ownerName, packageId, version);
     const tempBlobPath = `${absBlobPath}.tmp-${crypto
       .randomBytes(6)
       .toString("hex")}`;
 
+    let finalStatus;
     try {
       fs.mkdirSync(path.dirname(absBlobPath), { recursive: true });
       fs.writeFileSync(tempBlobPath, source);
 
-      if (owner.has_published === 1) {
-        db.transaction(() => {
+      const outcome = db
+        .transaction(() => {
+          const current = db
+            .prepare("SELECT has_published FROM owners WHERE id = ?")
+            .get(owner.id);
+          const derivedStatus =
+            current.has_published === 1 ? "published" : "pending";
+
+          const blocked =
+            current.has_published !== 1 &&
+            db
+              .prepare(
+                `SELECT id FROM versions WHERE owner_id = ? AND status = 'pending'`,
+              )
+              .get(owner.id);
+
+          if (blocked) return { blocked: true };
+
           db.prepare(
             `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
              VALUES (?, ?, ?, 'staging', ?, ?, ?)`,
@@ -330,68 +345,31 @@ export function createApp({ db, dataDir, config = {} }) {
             owner.id,
             packageId,
             version,
-            status,
+            derivedStatus,
             JSON.stringify(meta),
             absBlobPath,
           );
           fs.renameSync(tempBlobPath, absBlobPath);
           db.prepare(
             `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
-          ).run(status, owner.id, packageId, version);
-        })();
-      } else {
-        const staged = db
-          .transaction(() => {
-            if (
-              db
-                .prepare(
-                  `SELECT id FROM versions WHERE owner_id = ? AND status = 'pending'`,
-                )
-                .get(owner.id)
-            ) {
-              return null;
-            }
-            db.prepare(
-              `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
-             VALUES (?, ?, ?, 'staging', ?, ?, ?)`,
-            ).run(
-              owner.id,
-              packageId,
-              version,
-              status,
-              JSON.stringify(meta),
-              absBlobPath,
-            );
-            return true;
-          })
-          .immediate();
+          ).run(derivedStatus, owner.id, packageId, version);
 
-        if (!staged) {
-          fs.rmSync(tempBlobPath, { force: true });
-          res.status(409).json({
-            error:
-              "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
-          });
-          error(
+          return { status: derivedStatus };
+        })
+        .immediate();
+
+      if (outcome.blocked) {
+        fs.rmSync(tempBlobPath, { force: true });
+        res.status(409).json({
+          error:
             "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
-          );
-          return;
-        }
-
-        try {
-          db.transaction(() => {
-            fs.renameSync(tempBlobPath, absBlobPath);
-            db.prepare(
-              `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
-            ).run(status, owner.id, packageId, version);
-          }).immediate();
-        } catch (err) {
-          db.prepare(
-            `DELETE FROM versions WHERE owner_id = ? AND package_id = ? AND version = ?`,
-          ).run(owner.id, packageId, version);
-          throw err;
-        }
+        });
+        error(
+          "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+        );
+        return;
       }
+      finalStatus = outcome.status;
     } catch (err) {
       fs.rmSync(tempBlobPath, { force: true });
       if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
@@ -419,11 +397,11 @@ export function createApp({ db, dataDir, config = {} }) {
       owner: ownerName,
       id: packageId,
       version,
-      status,
+      status: finalStatus,
       url: `/v1/${ownerName}/${packageId}/${version}`,
     });
 
-    success(`${ownerName}/${packageId}@${version} (${status})`);
+    success(`${ownerName}/${packageId}@${version} (${finalStatus})`);
   });
 
   const latestPublishedSelections = `

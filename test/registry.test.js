@@ -491,6 +491,74 @@ describe("warp-registry publish flow", () => {
       .all();
     assert.deepEqual(rows, [{ status: "published" }]);
   });
+
+  test("publish is published, not left pending, when approval completes before reservation", async () => {
+    const token = insertOwner(db, "raceowner");
+    db.prepare(
+      `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
+       VALUES ((SELECT id FROM owners WHERE github_username = 'raceowner'),
+               'pkga', '0.1.0', 'pending', 'pending', '{}', '/tmp/nonexistent')`,
+    ).run();
+
+    const body = buildCustomBody({ id: "pkgb", version: "0.1.0" });
+    const encoder = new TextEncoder();
+    let finishBody;
+    const bodyReady = new Promise((r) => (finishBody = r));
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(body));
+        bodyReady.then(() => controller.close());
+      },
+    });
+
+    // Stream the request body so the publish handler reads the owner
+    // (has_published=0) and then parks awaiting readRawBody.
+    const publishing = fetch(`${base}/v1/publish`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/javascript",
+        Authorization: `Bearer ${token}`,
+      },
+      body: stream,
+      duplex: "half",
+    });
+
+    // While the handler is parked, approval completes: the pending version is
+    // published and the owner becomes approved.
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(
+      db
+        .prepare(
+          "SELECT has_published FROM owners WHERE github_username = 'raceowner'",
+        )
+        .get().has_published,
+      0,
+      "handler must have read the owner before approval completed",
+    );
+    db.prepare(
+      `UPDATE versions SET status = 'published'
+       WHERE owner_id = (SELECT id FROM owners WHERE github_username = 'raceowner')
+         AND package_id = 'pkga'`,
+    ).run();
+    db.prepare(
+      `UPDATE owners SET has_published = 1 WHERE github_username = 'raceowner'`,
+    ).run();
+    finishBody();
+
+    const res = await publishing;
+    assert.equal(res.status, 201);
+    const body2 = await res.json();
+    assert.equal(body2.status, "published");
+
+    const rows = db
+      .prepare(
+        `SELECT v.status FROM versions v
+         JOIN owners o ON o.id = v.owner_id
+         WHERE o.github_username = 'raceowner' AND v.package_id = 'pkgb'`,
+      )
+      .all();
+    assert.deepEqual(rows, [{ status: "published" }]);
+  });
 });
 
 /**
