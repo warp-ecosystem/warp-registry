@@ -726,6 +726,17 @@ describe("warp-registry search endpoint", () => {
       buildCustomBody({ id: "mypkg", name: "MultiVersion", version: "0.2.0" }),
     );
 
+    const sharpSToken = insertApprovedOwner(db, "sharpssowner");
+    await publishRaw(
+      base,
+      sharpSToken,
+      buildCustomBody({
+        id: "sharppkg",
+        name: "Stra\u00DFe",
+        description: "German sharp s package",
+      }),
+    );
+
     const pendingToken = insertOwner(db, "pendingsearch");
     await publishRaw(
       base,
@@ -773,6 +784,41 @@ describe("warp-registry search endpoint", () => {
     assert.deepEqual(
       body.results.map((r) => r.id),
       ["opiesearch"],
+    );
+  });
+
+  test("search matches ß-expanded names via full Unicode case folding", async () => {
+    const lower = await fetch(
+      `${base}/v1/search?q=${encodeURIComponent("strasse")}`,
+    );
+    assert.equal(lower.status, 200);
+    const lowerBody = await lower.json();
+    assert.deepEqual(
+      lowerBody.results.map((r) => r.id),
+      ["sharppkg"],
+      "strasse should match Straße",
+    );
+
+    const upper = await fetch(
+      `${base}/v1/search?q=${encodeURIComponent("STRASSE")}`,
+    );
+    assert.equal(upper.status, 200);
+    const upperBody = await upper.json();
+    assert.deepEqual(
+      upperBody.results.map((r) => r.id),
+      ["sharppkg"],
+      "STRASSE should match Straße",
+    );
+
+    const direct = await fetch(
+      `${base}/v1/search?q=${encodeURIComponent("Straße")}`,
+    );
+    assert.equal(direct.status, 200);
+    const directBody = await direct.json();
+    assert.deepEqual(
+      directBody.results.map((r) => r.id),
+      ["sharppkg"],
+      "Straße should match Straße",
     );
   });
 
