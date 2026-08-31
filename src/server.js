@@ -6,7 +6,17 @@ import { success, warn } from "./logger.js";
 
 const PORT = Number(process.env.PORT || 3000);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || "./data");
-const SHUTDOWN_TIMEOUT = Number(process.env.SHUTDOWN_TIMEOUT || 5000);
+const DEFAULT_SHUTDOWN_TIMEOUT = 5000;
+function resolveShutdownTimeout() {
+  const value = Number(
+    process.env.SHUTDOWN_TIMEOUT || DEFAULT_SHUTDOWN_TIMEOUT,
+  );
+  if (!Number.isFinite(value) || value < 1 || value > 2147483647) {
+    return DEFAULT_SHUTDOWN_TIMEOUT;
+  }
+  return value;
+}
+const SHUTDOWN_TIMEOUT = resolveShutdownTimeout();
 
 const config = {
   GITHUB_CLIENT_ID: process.env.GITHUB_CLIENT_ID,

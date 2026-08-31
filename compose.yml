@@ -11,5 +11,6 @@ services:
       - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
       - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-5000}
     volumes:
       - ./data:/app/data
