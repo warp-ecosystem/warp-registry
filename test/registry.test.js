@@ -328,9 +328,9 @@ describe("warp-registry publish flow", () => {
     assert.equal(bodyA.status, "pending");
 
     const b = await publishForVersion(base, token, "0.2.0");
-    assert.equal(b.status, 201);
+    assert.equal(b.status, 409);
     const bodyB = await b.json();
-    assert.equal(bodyB.status, "pending");
+    assert.match(bodyB.error, /already awaiting review/i);
 
     approve("reconcileowner", "helloworld", "0.1.0", dataDir);
     reconcileStagedVersions(db, dataDir);
@@ -342,10 +342,7 @@ describe("warp-registry publish flow", () => {
          WHERE o.github_username = 'reconcileowner' ORDER BY v.version`,
       )
       .all();
-    assert.deepEqual(rows, [
-      { version: "0.1.0", status: "published" },
-      { version: "0.2.0", status: "pending" },
-    ]);
+    assert.deepEqual(rows, [{ version: "0.1.0", status: "published" }]);
   });
 
   test("reconcile finalizes a staging row whose blob became durable", async () => {
@@ -389,6 +386,443 @@ describe("warp-registry publish flow", () => {
       )
       .get().c;
     assert.equal(count, 0);
+  });
+});
+
+/**
+ * Inserts a brand approved owner (has_published=1) and returns a token.
+ * @param {import('better-sqlite3').Database} db - The database instance.
+ * @param {string} username - The GitHub username.
+ * @returns {string} The generated token.
+ */
+function insertApprovedOwner(db, username) {
+  const token = crypto.randomBytes(32).toString("hex");
+  db.prepare(
+    "INSERT INTO owners (github_username, token_hash, has_published) VALUES (?, ?, 1)",
+  ).run(username, hashToken(token));
+  return token;
+}
+
+/**
+ * Builds a publish body from the helloworld fixture with overrides applied.
+ * @param {object} [overrides] - Field overrides for id, name, description, version.
+ * @returns {string} The publish body.
+ */
+function buildCustomBody(overrides = {}) {
+  let body = fs
+    .readFileSync(path.join(fixturesDir, "helloworld@0.1.0.js"))
+    .toString()
+    .replace('version: "0.1.0"', `version: "${overrides.version || "0.1.0"}"`)
+    .replace('id: "helloworld"', `id: "${overrides.id || "helloworld"}"`)
+    .replace('name: "It works!"', `name: "${overrides.name || "It works!"}"`)
+    .replace(
+      'description: "A description of the extension."',
+      `description: "${overrides.description || "A description of the extension."}"`,
+    );
+  return body;
+}
+
+/**
+ * Publishes a raw body string to the server.
+ * @param {string} base - The base URL of the test server.
+ * @param {string} token - The authentication token.
+ * @param {string} body - The request body.
+ * @returns {Promise<Response>} The fetch response.
+ */
+function publishRaw(base, token, body) {
+  return fetch(`${base}/v1/publish`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/javascript",
+      Authorization: `Bearer ${token}`,
+    },
+    body,
+  });
+}
+
+describe("warp-registry search endpoint", () => {
+  let server;
+  let db;
+  let base;
+
+  before(async () => {
+    ({ server, db, base } = await startServer());
+
+    const nameToken = insertApprovedOwner(db, "nameowner");
+    await publishRaw(
+      base,
+      nameToken,
+      buildCustomBody({
+        id: "namesearch",
+        name: "ZebraWidget",
+        description: "a widget for tests",
+      }),
+    );
+
+    const idToken = insertApprovedOwner(db, "idowner");
+    await publishRaw(
+      base,
+      idToken,
+      buildCustomBody({
+        id: "unicornpkg",
+        name: "Whatever",
+        description: "another package",
+      }),
+    );
+
+    const ownerToken = insertApprovedOwner(db, "ownerhunt");
+    await publishRaw(
+      base,
+      ownerToken,
+      buildCustomBody({ id: "pkgx", name: "Whatever Two" }),
+    );
+
+    const descToken = insertApprovedOwner(db, "descowner");
+    await publishRaw(
+      base,
+      descToken,
+      buildCustomBody({
+        id: "pkgy",
+        name: "Whatever Three",
+        description: "purplebanana",
+      }),
+    );
+
+    const multiverToken = insertApprovedOwner(db, "multiver");
+    await publishRaw(
+      base,
+      multiverToken,
+      buildCustomBody({ id: "mypkg", name: "MultiVersion", version: "0.1.0" }),
+    );
+    await publishRaw(
+      base,
+      multiverToken,
+      buildCustomBody({ id: "mypkg", name: "MultiVersion", version: "0.2.0" }),
+    );
+
+    const pendingToken = insertOwner(db, "pendingsearch");
+    await publishRaw(
+      base,
+      pendingToken,
+      buildCustomBody({
+        id: "pkgpending",
+        name: "PineappleExpress",
+        description: "pending only",
+      }),
+    );
+  });
+
+  after(async () => {
+    await closeServer(server);
+    db.close();
+  });
+
+  test("empty or missing q returns 400", async () => {
+    const missing = await fetch(`${base}/v1/search`);
+    assert.equal(missing.status, 400);
+
+    const empty = await fetch(`${base}/v1/search?q=`);
+    assert.equal(empty.status, 400);
+
+    const blank = await fetch(`${base}/v1/search?q=%20%20`);
+    assert.equal(blank.status, 400);
+  });
+
+  test("search matches on display name (case-insensitive)", async () => {
+    const res = await fetch(`${base}/v1/search?q=zebrawidget`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(
+      body.results.map((r) => r.id),
+      ["namesearch"],
+    );
+  });
+
+  test("search matches on package_id", async () => {
+    const res = await fetch(`${base}/v1/search?q=unicornpkg`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(
+      body.results.map((r) => r.id),
+      ["unicornpkg"],
+    );
+  });
+
+  test("search matches on owner github_username", async () => {
+    const res = await fetch(`${base}/v1/search?q=ownerhunt`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(
+      body.results.map((r) => r.id),
+      ["pkgx"],
+    );
+  });
+
+  test("search matches on description", async () => {
+    const res = await fetch(`${base}/v1/search?q=purplebanana`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(
+      body.results.map((r) => r.id),
+      ["pkgy"],
+    );
+  });
+
+  test("search does not return a pending package even if its name matches", async () => {
+    const res = await fetch(`${base}/v1/search?q=PineappleExpress`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(body.results, []);
+  });
+
+  test("search never returns duplicates for a package with multiple published versions", async () => {
+    const res = await fetch(`${base}/v1/search?q=multiversion`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.results.length, 1);
+    assert.equal(body.results[0].id, "mypkg");
+    assert.equal(body.results[0].latestVersion, "0.2.0");
+  });
+});
+
+describe("warp-registry packages pagination", () => {
+  let server;
+  let db;
+  let base;
+
+  before(async () => {
+    ({ server, db, base } = await startServer());
+
+    const setCreatedAt = (owner, id, createdAt) => {
+      db.prepare(
+        `UPDATE versions SET created_at = ?
+         WHERE owner_id = (SELECT id FROM owners WHERE github_username = ?)
+           AND package_id = ?`,
+      ).run(createdAt, owner, id);
+    };
+
+    const tokenA = insertApprovedOwner(db, "paga");
+    await publishRaw(
+      base,
+      tokenA,
+      buildCustomBody({ id: "aaa", name: "Package A", version: "1.0.0" }),
+    );
+    setCreatedAt("paga", "aaa", "2024-01-01 10:00:00");
+
+    const tokenB = insertApprovedOwner(db, "pagb");
+    await publishRaw(
+      base,
+      tokenB,
+      buildCustomBody({ id: "bbb", name: "Package B", version: "1.0.0" }),
+    );
+    setCreatedAt("pagb", "bbb", "2024-01-02 10:00:00");
+
+    const tokenC = insertApprovedOwner(db, "pagc");
+    await publishRaw(
+      base,
+      tokenC,
+      buildCustomBody({ id: "ccc", name: "Package C", version: "1.0.0" }),
+    );
+    setCreatedAt("pagc", "ccc", "2024-01-03 10:00:00");
+  });
+
+  after(async () => {
+    await closeServer(server);
+    db.close();
+  });
+
+  test("returns results in recency order and paginates with nextCursor", async () => {
+    const page1Res = await fetch(`${base}/v1/packages?limit=2`);
+    assert.equal(page1Res.status, 200);
+    const page1 = await page1Res.json();
+    assert.deepEqual(
+      page1.packages.map((p) => p.id),
+      ["ccc", "bbb"],
+    );
+    assert.ok(page1.nextCursor, "first page must have a nextCursor");
+
+    const page2Res = await fetch(
+      `${base}/v1/packages?limit=2&cursor=${encodeURIComponent(page1.nextCursor)}`,
+    );
+    assert.equal(page2Res.status, 200);
+    const page2 = await page2Res.json();
+    assert.deepEqual(
+      page2.packages.map((p) => p.id),
+      ["aaa"],
+    );
+    assert.equal(page2.nextCursor, null, "last page must have null nextCursor");
+  });
+
+  test("response shape includes owner, id, name, description, latestVersion, publishedAt", async () => {
+    const res = await fetch(`${base}/v1/packages?limit=1`);
+    const body = await res.json();
+    const pkg = body.packages[0];
+    assert.deepEqual(Object.keys(pkg).sort(), [
+      "description",
+      "id",
+      "latestVersion",
+      "name",
+      "owner",
+      "publishedAt",
+    ]);
+    assert.equal(pkg.id, "ccc");
+    assert.equal(pkg.name, "Package C");
+    assert.equal(pkg.latestVersion, "1.0.0");
+    assert.equal(pkg.publishedAt, "2024-01-03 10:00:00");
+  });
+});
+
+describe("warp-registry packages pagination: limit and cursor validation", () => {
+  let server;
+  let db;
+  let base;
+
+  before(async () => {
+    ({ server, db, base } = await startServer());
+
+    const token = insertApprovedOwner(db, "bulkowner");
+    for (let i = 0; i < 55; i++) {
+      const id = `bulk${String(i).padStart(2, "0")}`;
+      await publishRaw(base, token, buildCustomBody({ id, name: `Bulk ${i}` }));
+    }
+  });
+
+  after(async () => {
+    await closeServer(server);
+    db.close();
+  });
+
+  test("limit above 50 is clamped to 50", async () => {
+    const res = await fetch(`${base}/v1/packages?limit=100`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.packages.length, 50);
+    assert.ok(body.nextCursor, "a nextCursor should remain after clamping");
+  });
+
+  test("invalid cursor returns 400", async () => {
+    const notBase64 = await fetch(`${base}/v1/packages?cursor=not-a-cursor`);
+    assert.equal(notBase64.status, 400);
+
+    const badJson = await fetch(
+      `${base}/v1/packages?cursor=${encodeURIComponent(Buffer.from("not json").toString("base64"))}`,
+    );
+    assert.equal(badJson.status, 400);
+  });
+});
+
+describe("warp-registry stats endpoint", () => {
+  let server;
+  let db;
+  let base;
+
+  before(async () => {
+    ({ server, db, base } = await startServer());
+
+    const token1 = insertApprovedOwner(db, "statowner1");
+    await publishRaw(
+      base,
+      token1,
+      buildCustomBody({ id: "statpkg", version: "0.1.0" }),
+    );
+    await publishRaw(
+      base,
+      token1,
+      buildCustomBody({ id: "statpkg", version: "0.2.0" }),
+    );
+
+    const token2 = insertApprovedOwner(db, "statowner2");
+    await publishRaw(
+      base,
+      token2,
+      buildCustomBody({ id: "otherpkg", version: "1.0.0" }),
+    );
+
+    const pendingToken = insertOwner(db, "statpendingowner");
+    await publishRaw(
+      base,
+      pendingToken,
+      buildCustomBody({ id: "pendingpkg", version: "0.1.0" }),
+    );
+  });
+
+  after(async () => {
+    await closeServer(server);
+    db.close();
+  });
+
+  test("stats reflect published pairs, pending rows, and distinct authors", async () => {
+    const res = await fetch(`${base}/v1/stats`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.published, 2);
+    assert.equal(body.pending, 1);
+    assert.equal(body.authors, 2);
+  });
+});
+
+describe("warp-registry second pending publish guard", () => {
+  let server;
+  let dataDir;
+  let db;
+  let base;
+
+  before(async () => {
+    ({ server, dataDir, db, base } = await startServer());
+  });
+
+  after(async () => {
+    await closeServer(server);
+    db.close();
+  });
+
+  test("an unapproved owner is blocked from a second pending publish, then unblocked once approved", async () => {
+    const token = insertOwner(db, "pendingguard");
+
+    const aRes = await publishRaw(
+      base,
+      token,
+      buildCustomBody({ id: "pkga", version: "0.1.0" }),
+    );
+    assert.equal(aRes.status, 201);
+    assert.equal((await aRes.json()).status, "pending");
+
+    const bRes = await publishRaw(
+      base,
+      token,
+      buildCustomBody({ id: "pkgb", version: "0.1.0" }),
+    );
+    assert.equal(bRes.status, 409);
+    const bBody = await bRes.json();
+    assert.match(bBody.error, /already awaiting review/i);
+
+    const bRows = db
+      .prepare(
+        `SELECT v.* FROM versions v JOIN owners o ON o.id = v.owner_id
+         WHERE o.github_username = 'pendingguard' AND v.package_id = 'pkgb'`,
+      )
+      .all();
+    assert.equal(
+      bRows.length,
+      0,
+      "no row may be written for the blocked publish",
+    );
+    assert.equal(
+      fs.existsSync(blobPath(dataDir, "pendingguard", "pkgb", "0.1.0")),
+      false,
+      "no blob may be written for the blocked publish",
+    );
+
+    approve("pendingguard", "pkga", "0.1.0", dataDir);
+
+    const bRetry = await publishRaw(
+      base,
+      token,
+      buildCustomBody({ id: "pkgb", version: "0.1.0" }),
+    );
+    assert.equal(bRetry.status, 201);
+    const bRetryBody = await bRetry.json();
+    assert.equal(bRetryBody.status, "published");
   });
 });
 

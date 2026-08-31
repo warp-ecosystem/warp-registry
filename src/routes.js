@@ -251,6 +251,24 @@ export function createApp({ db, dataDir, config = {} }) {
       return;
     }
 
+    if (
+      owner.has_published === 0 &&
+      db
+        .prepare(
+          `SELECT id FROM versions WHERE owner_id = ? AND status = 'pending'`,
+        )
+        .get(owner.id)
+    ) {
+      res.status(409).json({
+        error:
+          "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+      });
+      error(
+        "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+      );
+      return;
+    }
+
     const status = owner.has_published === 1 ? "published" : "pending";
 
     const absBlobPath = blobPath(dataDir, ownerName, packageId, version);
@@ -314,6 +332,163 @@ export function createApp({ db, dataDir, config = {} }) {
     });
 
     success(`${ownerName}/${packageId}@${version} (${status})`);
+  });
+
+  const latestPublishedSelections = `
+    SELECT o.github_username AS owner, v.package_id AS id,
+           v.meta_json AS meta_json, v.version AS latestVersion,
+           v.created_at AS created_at,
+           ROW_NUMBER() OVER (
+             PARTITION BY v.owner_id, v.package_id
+             ORDER BY v.created_at DESC, v.id DESC
+           ) AS rn
+    FROM versions v
+    JOIN owners o ON o.id = v.owner_id
+    WHERE v.status = 'published'
+  `;
+
+  app.get("/v1/search", (req, res) => {
+    const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+    if (!q) {
+      res.status(400).json({ error: "Missing required `q` query parameter." });
+      error("Missing required `q` query parameter.");
+      return;
+    }
+    const pattern = `%${q}%`;
+    const rows = db
+      .prepare(
+        `SELECT owner, id, meta_json, latestVersion
+         FROM (${latestPublishedSelections}) t
+         WHERE t.rn = 1
+           AND (t.meta_json LIKE ? OR t.id LIKE ? OR t.owner LIKE ?)
+         LIMIT 10`,
+      )
+      .all(pattern, pattern, pattern);
+    res.json({
+      results: rows.map((r) => {
+        const meta = JSON.parse(r.meta_json);
+        return {
+          owner: r.owner,
+          id: r.id,
+          name: meta.name,
+          description: meta.description,
+          latestVersion: r.latestVersion,
+        };
+      }),
+    });
+  });
+
+  app.get("/v1/packages", (req, res) => {
+    let limit = 20;
+    if (req.query.limit !== undefined) {
+      const parsed = Number(req.query.limit);
+      if (Number.isFinite(parsed) && parsed >= 0) limit = parsed;
+    }
+    limit = Math.min(limit, 50);
+
+    let cursor = null;
+    if (req.query.cursor !== undefined && req.query.cursor !== "") {
+      let decoded;
+      try {
+        decoded = JSON.parse(
+          Buffer.from(req.query.cursor, "base64").toString("utf8"),
+        );
+      } catch {
+        res.status(400).json({ error: "Invalid cursor." });
+        return;
+      }
+      if (
+        !decoded ||
+        typeof decoded !== "object" ||
+        typeof decoded.createdAt !== "string" ||
+        typeof decoded.owner !== "string" ||
+        typeof decoded.packageId !== "string"
+      ) {
+        res.status(400).json({ error: "Invalid cursor." });
+        return;
+      }
+      cursor = decoded;
+    }
+
+    let where = "WHERE t.rn = 1";
+    const params = [];
+    if (cursor) {
+      where += ` AND (
+        t.created_at < ? OR
+        (t.created_at = ? AND (t.owner > ? OR (t.owner = ? AND t.id > ?)))
+      )`;
+      params.push(
+        cursor.createdAt,
+        cursor.createdAt,
+        cursor.owner,
+        cursor.owner,
+        cursor.packageId,
+      );
+    }
+
+    const rows = db
+      .prepare(
+        `SELECT t.owner, t.id, t.meta_json, t.latestVersion, t.created_at
+         FROM (${latestPublishedSelections}) t
+         ${where}
+         ORDER BY t.created_at DESC, t.owner ASC, t.id ASC
+         LIMIT ?`,
+      )
+      .all(...params, limit + 1);
+
+    const hasMore = rows.length > limit;
+    const page = rows.slice(0, limit);
+
+    let nextCursor = null;
+    if (hasMore) {
+      const last = page[page.length - 1];
+      nextCursor = Buffer.from(
+        JSON.stringify({
+          createdAt: last.created_at,
+          owner: last.owner,
+          packageId: last.id,
+        }),
+      ).toString("base64");
+    }
+
+    res.json({
+      packages: page.map((r) => {
+        const meta = JSON.parse(r.meta_json);
+        return {
+          owner: r.owner,
+          id: r.id,
+          name: meta.name,
+          description: meta.description,
+          latestVersion: r.latestVersion,
+          publishedAt: r.created_at,
+        };
+      }),
+      nextCursor,
+    });
+  });
+
+  app.get("/v1/stats", (req, res) => {
+    const published = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM (
+           SELECT 1 FROM versions WHERE status = 'published'
+           GROUP BY owner_id, package_id
+         )`,
+      )
+      .get().c;
+    const pending = db
+      .prepare(`SELECT COUNT(*) AS c FROM versions WHERE status = 'pending'`)
+      .get().c;
+    const authors = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM (
+           SELECT 1 FROM versions WHERE status = 'published'
+           GROUP BY owner_id
+         )`,
+      )
+      .get().c;
+
+    res.json({ published, pending, authors });
   });
 
   app.get("/v1/:owner/:id", (req, res) => {
