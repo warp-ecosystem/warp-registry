@@ -2,6 +2,7 @@ services:
   warp-registry:
     image: ghcr.io/warp-ecosystem/warp-registry:latest
     restart: unless-stopped
+    stop_grace_period: 10s
     ports:
       - "${PORT:-3000}:3000"
     environment:
