@@ -33,7 +33,8 @@ const approve = db.transaction(() => {
   const result = db
     .prepare(
       `UPDATE versions SET status = 'published'
-       WHERE owner_id = ? AND package_id = ? AND version = ?`,
+       WHERE owner_id = ? AND package_id = ? AND version = ?
+         AND status = 'pending'`,
     )
     .run(owner.id, packageId, version);
 

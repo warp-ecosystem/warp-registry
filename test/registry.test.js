@@ -272,7 +272,9 @@ describe("warp-registry publish flow", () => {
       });
       assert.equal(res.status, 201);
       const outer = await res.json();
-      approve(outer.owner, outer.id, outer.version, dataDirFor);
+      if (outer.status === "pending") {
+        approve(outer.owner, outer.id, outer.version, dataDirFor);
+      }
     };
 
     await publishVersion("2.0.0");
