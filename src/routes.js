@@ -23,6 +23,28 @@ export function hashToken(token) {
 }
 
 /**
+ * Builds a byte-wise sortable key for a semver version so that ORDER BY on the
+ * key reproduces full SemVer precedence, including prerelease identifiers.
+ * Build metadata is ignored, per the semver spec.
+ * @param {string} version - A valid semver version string.
+ * @returns {string} A key ordered identically to semver precedence.
+ */
+export function semverSortKey(version) {
+  const parsed = semver.parse(version);
+  if (!parsed) return version;
+  const pad = (n) => String(n).padStart(20, "0");
+  let key = `${pad(parsed.major)}${pad(parsed.minor)}${pad(parsed.patch)}`;
+  if (parsed.prerelease.length === 0) return `${key}\x7f`;
+  for (const id of parsed.prerelease) {
+    if (/^\d+$/.test(id)) key += `0${pad(id)}!`;
+    else key += `A${id}!`;
+  }
+  return key;
+}
+
+const semverSortKeyRegistered = new WeakSet();
+
+/**
  * Creates and configures the Express application.
  * Sets up all routes for OAuth, publishing, and serving packages.
  * @param {object} options - Configuration options.
@@ -34,6 +56,11 @@ export function hashToken(token) {
 export function createApp({ db, dataDir, config = {} }) {
   const app = express();
   app.use(express.json());
+
+  if (!semverSortKeyRegistered.has(db)) {
+    db.function("semverSortKey", { deterministic: true }, semverSortKey);
+    semverSortKeyRegistered.add(db);
+  }
 
   app.get("/login", (req, res) => {
     const { GITHUB_CLIENT_ID: clientId } = config;
@@ -340,11 +367,7 @@ export function createApp({ db, dataDir, config = {} }) {
            v.created_at AS created_at,
            ROW_NUMBER() OVER (
              PARTITION BY v.owner_id, v.package_id
-             ORDER BY
-               CAST(SUBSTR(v.version, 1, INSTR(v.version, '.') - 1) AS INTEGER) DESC,
-               CAST(SUBSTR(SUBSTR(v.version, INSTR(v.version, '.') + 1), 1, INSTR(SUBSTR(v.version, INSTR(v.version, '.') + 1), '.') - 1) AS INTEGER) DESC,
-               CAST(SUBSTR(SUBSTR(v.version, INSTR(v.version, '.') + 1), INSTR(SUBSTR(v.version, INSTR(v.version, '.') + 1), '.') + 1) AS INTEGER) DESC,
-               v.created_at DESC, v.id DESC
+             ORDER BY semverSortKey(v.version) DESC, v.id DESC
            ) AS rn
     FROM versions v
     JOIN owners o ON o.id = v.owner_id
@@ -358,13 +381,19 @@ export function createApp({ db, dataDir, config = {} }) {
       error("Missing required `q` query parameter.");
       return;
     }
-    const pattern = `%${q}%`;
+    const escaped = q
+      .replace(/\\/g, "\\\\")
+      .replace(/%/g, "\\%")
+      .replace(/_/g, "\\_");
+    const pattern = `%${escaped}%`;
     const rows = db
       .prepare(
         `SELECT owner, id, meta_json, latestVersion
          FROM (${latestPublishedSelections}) t
          WHERE t.rn = 1
-           AND (t.meta_json LIKE ? OR t.id LIKE ? OR t.owner LIKE ?)
+           AND (t.meta_json LIKE ? ESCAPE '\\'
+             OR t.id LIKE ? ESCAPE '\\'
+             OR t.owner LIKE ? ESCAPE '\\')
          LIMIT 10`,
       )
       .all(pattern, pattern, pattern);

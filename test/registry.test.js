@@ -619,6 +619,187 @@ describe("warp-registry search endpoint", () => {
   });
 });
 
+describe("warp-registry semver precedence in discovery routes", () => {
+  let server;
+  let db;
+  let base;
+
+  before(async () => {
+    ({ server, db, base } = await startServer());
+
+    const setCreatedAt = (owner, id, version, createdAt) => {
+      db.prepare(
+        `UPDATE versions SET created_at = ?
+         WHERE owner_id = (SELECT id FROM owners WHERE github_username = ?)
+           AND package_id = ? AND version = ?`,
+      ).run(createdAt, owner, id, version);
+    };
+
+    const token = insertApprovedOwner(db, "preowner");
+    const publishVersion = async (pkgId, version) => {
+      const res = await publishRaw(
+        base,
+        token,
+        buildCustomBody({ id: pkgId, name: pkgId, version }),
+      );
+      assert.equal(res.status, 201);
+    };
+
+    await publishVersion("releasepkg", "1.0.0");
+    await publishVersion("releasepkg", "1.0.0-beta.1");
+    setCreatedAt("preowner", "releasepkg", "1.0.0", "2024-01-01 10:00:00");
+    setCreatedAt(
+      "preowner",
+      "releasepkg",
+      "1.0.0-beta.1",
+      "2024-01-02 10:00:00",
+    );
+
+    await publishVersion("numericprepkg", "1.0.0-beta.10");
+    await publishVersion("numericprepkg", "1.0.0-beta.2");
+    setCreatedAt(
+      "preowner",
+      "numericprepkg",
+      "1.0.0-beta.10",
+      "2024-01-01 10:00:00",
+    );
+    setCreatedAt(
+      "preowner",
+      "numericprepkg",
+      "1.0.0-beta.2",
+      "2024-01-02 10:00:00",
+    );
+
+    await publishVersion("alphapkg", "1.0.0-beta");
+    await publishVersion("alphapkg", "1.0.0-alpha");
+    setCreatedAt("preowner", "alphapkg", "1.0.0-beta", "2024-01-01 10:00:00");
+    setCreatedAt("preowner", "alphapkg", "1.0.0-alpha", "2024-01-02 10:00:00");
+
+    await publishVersion("numericpkg", "1.0.0-alpha");
+    await publishVersion("numericpkg", "1.0.0-1");
+    setCreatedAt(
+      "preowner",
+      "numericpkg",
+      "1.0.0-alpha",
+      "2024-01-01 10:00:00",
+    );
+    setCreatedAt("preowner", "numericpkg", "1.0.0-1", "2024-01-02 10:00:00");
+  });
+
+  after(async () => {
+    await closeServer(server);
+    db.close();
+  });
+
+  async function latestFromSearchAndPackages(pkgId) {
+    const searchRes = await fetch(
+      `${base}/v1/search?q=${encodeURIComponent(pkgId)}`,
+    );
+    assert.equal(searchRes.status, 200);
+    const searchBody = await searchRes.json();
+    const searchMatch = searchBody.results.find((r) => r.id === pkgId);
+
+    const packagesRes = await fetch(`${base}/v1/packages?limit=50`);
+    assert.equal(packagesRes.status, 200);
+    const packagesBody = await packagesRes.json();
+    const packagesMatch = packagesBody.packages.find((p) => p.id === pkgId);
+
+    return { searchMatch, packagesMatch };
+  }
+
+  async function assertLatest(pkgId, expected) {
+    const { searchMatch, packagesMatch } =
+      await latestFromSearchAndPackages(pkgId);
+    assert.ok(searchMatch, `search must return ${pkgId}`);
+    assert.equal(searchMatch.latestVersion, expected);
+    assert.ok(packagesMatch, `packages must return ${pkgId}`);
+    assert.equal(packagesMatch.latestVersion, expected);
+  }
+
+  test("a normal release beats an identical-core prerelease regardless of created_at", async () => {
+    await assertLatest("releasepkg", "1.0.0");
+  });
+
+  test("numeric prerelease identifiers sort numerically, not lexically", async () => {
+    await assertLatest("numericprepkg", "1.0.0-beta.10");
+  });
+
+  test("alphanumeric prerelease identifiers sort by ASCII order", async () => {
+    await assertLatest("alphapkg", "1.0.0-beta");
+  });
+
+  test("numeric prerelease identifiers sort below alphanumeric ones", async () => {
+    await assertLatest("numericpkg", "1.0.0-alpha");
+  });
+});
+
+describe("warp-registry search LIKE escaping", () => {
+  let server;
+  let db;
+  let base;
+
+  before(async () => {
+    ({ server, db, base } = await startServer());
+
+    const underscoreToken = insertApprovedOwner(db, "usowner");
+    await publishRaw(
+      base,
+      underscoreToken,
+      buildCustomBody({ id: "foo_bar", name: "Foo Bar" }),
+    );
+
+    const wildcardishToken = insertApprovedOwner(db, "usowner2");
+    await publishRaw(
+      base,
+      wildcardishToken,
+      buildCustomBody({ id: "fooxbar", name: "Foo X Bar" }),
+    );
+
+    const percentToken = insertApprovedOwner(db, "pctowner");
+    await publishRaw(
+      base,
+      percentToken,
+      buildCustomBody({ id: "pctpkg1", description: "100%guaranteed" }),
+    );
+
+    const wildcardPctToken = insertApprovedOwner(db, "pctowner2");
+    await publishRaw(
+      base,
+      wildcardPctToken,
+      buildCustomBody({ id: "pctpkg2", description: "100x guaranteed" }),
+    );
+  });
+
+  after(async () => {
+    await closeServer(server);
+    db.close();
+  });
+
+  test("underscore in q is matched literally, not as a single-character wildcard", async () => {
+    const res = await fetch(
+      `${base}/v1/search?q=${encodeURIComponent("foo_bar")}`,
+    );
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(
+      body.results.map((r) => r.id),
+      ["foo_bar"],
+    );
+  });
+
+  test("percent in q is matched literally, not as a wildcard", async () => {
+    const res = await fetch(
+      `${base}/v1/search?q=${encodeURIComponent("100%guaranteed")}`,
+    );
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(
+      body.results.map((r) => r.id),
+      ["pctpkg1"],
+    );
+  });
+});
+
 describe("warp-registry packages pagination", () => {
   let server;
   let db;
