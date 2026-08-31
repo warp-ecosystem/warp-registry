@@ -45,6 +45,20 @@ export function semverSortKey(version) {
 const semverSortKeyRegistered = new WeakSet();
 
 /**
+ * Case-folds a string using the full Unicode case mapping (not just ASCII).
+ * SQLite's built-in LIKE and lower() only fold ASCII (A-Z/a-z), so this is
+ * used for name matching to support non-ASCII case-insensitivity (e.g. \u00e6/Æ).
+ * @param {unknown} value - The value to fold.
+ * @returns {string} The case-folded string, or an empty string for NULL.
+ */
+function unicodeFold(value) {
+  if (value == null) return "";
+  return String(value).toLowerCase();
+}
+
+const unicodeFoldRegistered = new WeakSet();
+
+/**
  * Detects a violation of the partial unique index that allows at most one
  * staging or pending version per owner, distinguishing it from the per-version
  * uniqueness constraint.
@@ -55,16 +69,19 @@ const semverSortKeyRegistered = new WeakSet();
  * @param {unknown} err - The error thrown by better-sqlite3.
  * @param {import('better-sqlite3').Database} db - The database instance.
  * @param {number} ownerId - The id of the owner performing the publish.
+ * @param {string} packageId - The package id being published.
+ * @param {string} version - The version being published.
  * @returns {boolean} True if the error is the one-pending-per-owner violation.
  */
-function isPendingConflict(err, db, ownerId) {
+function isPendingConflict(err, db, ownerId, packageId, version) {
   if (
     db
       .prepare(
         `SELECT 1 FROM versions
-         WHERE owner_id = ? AND status IN ('staging', 'pending')`,
+         WHERE owner_id = ? AND status IN ('staging', 'pending')
+           AND NOT (package_id = ? AND version = ?)`,
       )
-      .get(ownerId)
+      .get(ownerId, packageId, version)
   ) {
     return true;
   }
@@ -92,6 +109,11 @@ export function createApp({ db, dataDir, config = {} }) {
   if (!semverSortKeyRegistered.has(db)) {
     db.function("semverSortKey", { deterministic: true }, semverSortKey);
     semverSortKeyRegistered.add(db);
+  }
+
+  if (!unicodeFoldRegistered.has(db)) {
+    db.function("unicode_fold", { deterministic: true }, unicodeFold);
+    unicodeFoldRegistered.add(db);
   }
 
   app.get("/login", (req, res) => {
@@ -332,9 +354,11 @@ export function createApp({ db, dataDir, config = {} }) {
             current.has_published !== 1 &&
             db
               .prepare(
-                `SELECT id FROM versions WHERE owner_id = ? AND status = 'pending'`,
+                `SELECT id FROM versions
+                 WHERE owner_id = ? AND status = 'pending'
+                   AND NOT (package_id = ? AND version = ?)`,
               )
-              .get(owner.id);
+              .get(owner.id, packageId, version);
 
           if (blocked) return { blocked: true };
 
@@ -379,7 +403,7 @@ export function createApp({ db, dataDir, config = {} }) {
         fs.rmSync(absBlobPath, { force: true });
       }
       if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
-        if (isPendingConflict(err, db, owner.id)) {
+        if (isPendingConflict(err, db, owner.id, packageId, version)) {
           res.status(409).json({
             error:
               "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
@@ -440,7 +464,8 @@ export function createApp({ db, dataDir, config = {} }) {
         `SELECT owner, id, meta_json, latestVersion
          FROM (${latestPublishedSelections}) t
          WHERE t.rn = 1
-           AND (json_extract(t.meta_json, '$.name') LIKE ? ESCAPE '\\'
+           AND (unicode_fold(json_extract(t.meta_json, '$.name'))
+                  LIKE unicode_fold(?) ESCAPE '\\'
              OR json_extract(t.meta_json, '$.version') LIKE ? ESCAPE '\\'
              OR json_extract(t.meta_json, '$.license') LIKE ? ESCAPE '\\'
              OR json_extract(t.meta_json, '$.description') LIKE ? ESCAPE '\\'

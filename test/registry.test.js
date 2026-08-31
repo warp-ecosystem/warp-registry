@@ -227,6 +227,49 @@ describe("warp-registry publish flow", () => {
     );
   });
 
+  test("concurrent same version publish is reported as a duplicate-version conflict, not an owner-level conflict", async () => {
+    const token = insertOwner(db, "concurrentdupver");
+    const body = fs.readFileSync(path.join(fixturesDir, "helloworld@0.1.0.js"));
+    const encoder = new TextEncoder();
+
+    const makeStreamedPublish = () => {
+      let finishBody;
+      const bodyReady = new Promise((r) => (finishBody = r));
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(body));
+          bodyReady.then(() => controller.close());
+        },
+      });
+      const req = fetch(`${base}/v1/publish`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/javascript",
+          Authorization: `Bearer ${token}`,
+        },
+        body: stream,
+        duplex: "half",
+      });
+      return { req, finishBody };
+    };
+
+    const first = makeStreamedPublish();
+    const second = makeStreamedPublish();
+
+    await new Promise((r) => setTimeout(r, 80));
+    first.finishBody();
+    second.finishBody();
+
+    const [a, b] = await Promise.all([first.req, second.req]);
+    const statuses = [a.status, b.status].sort();
+    assert.deepEqual(statuses, [201, 409]);
+
+    const rejected = a.status === 409 ? a : b;
+    const rejectedBody = await rejected.json();
+    assert.match(rejectedBody.error, /already exists/i);
+    assert.doesNotMatch(rejectedBody.error, /awaiting review/i);
+  });
+
   test("concurrent publishes for the same unapproved owner with different versions yield one 201 and one 409", async () => {
     const token = insertOwner(db, "concurrentdiffowner");
 
@@ -660,6 +703,17 @@ describe("warp-registry search endpoint", () => {
       }),
     );
 
+    const unicodeToken = insertApprovedOwner(db, "unicodeowner");
+    await publishRaw(
+      base,
+      unicodeToken,
+      buildCustomBody({
+        id: "opiesearch",
+        name: "ÆnigmaWidget",
+        description: "unicode name",
+      }),
+    );
+
     const multiverToken = insertApprovedOwner(db, "multiver");
     await publishRaw(
       base,
@@ -707,6 +761,18 @@ describe("warp-registry search endpoint", () => {
     assert.deepEqual(
       body.results.map((r) => r.id),
       ["namesearch"],
+    );
+  });
+
+  test("search matches on display name with non-ASCII case folding", async () => {
+    const res = await fetch(
+      `${base}/v1/search?q=${encodeURIComponent("ænigmawidget")}`,
+    );
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(
+      body.results.map((r) => r.id),
+      ["opiesearch"],
     );
   });
 
