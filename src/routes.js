@@ -379,17 +379,18 @@ export function createApp({ db, dataDir, config = {} }) {
         }
 
         try {
-          fs.renameSync(tempBlobPath, absBlobPath);
+          db.transaction(() => {
+            fs.renameSync(tempBlobPath, absBlobPath);
+            db.prepare(
+              `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
+            ).run(status, owner.id, packageId, version);
+          }).immediate();
         } catch (err) {
           db.prepare(
             `DELETE FROM versions WHERE owner_id = ? AND package_id = ? AND version = ?`,
           ).run(owner.id, packageId, version);
           throw err;
         }
-
-        db.prepare(
-          `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
-        ).run(status, owner.id, packageId, version);
       }
     } catch (err) {
       fs.rmSync(tempBlobPath, { force: true });

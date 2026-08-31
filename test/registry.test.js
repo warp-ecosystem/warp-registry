@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { openDatabase, blobPath } from "../src/db.js";
 import {
   createApp,
@@ -79,6 +79,31 @@ function approve(username, packageId, version, dataDir) {
     [path.join(root, "scripts", "approve.js"), username, packageId, version],
     { env: { ...process.env, DATA_DIR: dataDir } },
   ).toString();
+}
+
+/**
+ * Runs the approve script asynchronously to approve a pending package version.
+ * @param {string} username - The owner's username.
+ * @param {string} packageId - The package identifier.
+ * @param {string} version - The package version.
+ * @param {string} dataDir - The data directory path.
+ * @returns {Promise<string>} The script output.
+ */
+function approveAsync(username, packageId, version, dataDir) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      process.execPath,
+      [path.join(root, "scripts", "approve.js"), username, packageId, version],
+      { env: { ...process.env, DATA_DIR: dataDir } },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(`approve failed: ${stderr.toString()}`));
+          return;
+        }
+        resolve(stdout.toString());
+      },
+    );
+  });
 }
 
 /**
@@ -414,6 +439,57 @@ describe("warp-registry publish flow", () => {
       )
       .get().c;
     assert.equal(count, 0);
+  });
+
+  test("approval does not miss a version during an in-flight staging->pending transition", async () => {
+    const token = insertOwner(db, "transitionowner");
+    const res = await publish(base, token, "helloworld@0.1.0.js");
+    assert.equal(res.status, 201);
+
+    assert.ok(
+      fs.existsSync(
+        blobPath(dataDir, "transitionowner", "helloworld", "0.1.0"),
+      ),
+      "blob must be durable during the transition window",
+    );
+
+    // A second connection holds the write lock with the transition in flight:
+    // the blob is already durable but the row is still 'staging' (final
+    // status 'pending'), exactly the state between the blob rename and the
+    // status flip. Approval must be mutually exclusive with this transition.
+    const other = openDatabase(dataDir);
+    other.exec("BEGIN IMMEDIATE");
+    other
+      .prepare(
+        `UPDATE versions SET status = 'staging', final_status = 'pending'
+         WHERE owner_id = (SELECT id FROM owners WHERE github_username = 'transitionowner')`,
+      )
+      .run();
+
+    const approving = (async () => {
+      await new Promise((r) => setTimeout(r, 50));
+      return approveAsync("transitionowner", "helloworld", "0.1.0", dataDir);
+    })();
+
+    other
+      .prepare(
+        `UPDATE versions SET status = 'pending'
+         WHERE owner_id = (SELECT id FROM owners WHERE github_username = 'transitionowner')`,
+      )
+      .run();
+    other.exec("COMMIT");
+    other.close();
+
+    await approving;
+
+    const rows = db
+      .prepare(
+        `SELECT v.status FROM versions v
+         JOIN owners o ON o.id = v.owner_id
+         WHERE o.github_username = 'transitionowner'`,
+      )
+      .all();
+    assert.deepEqual(rows, [{ status: "published" }]);
   });
 });
 
