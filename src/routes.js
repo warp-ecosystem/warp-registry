@@ -372,6 +372,12 @@ export function createApp({ db, dataDir, config = {} }) {
       finalStatus = outcome.status;
     } catch (err) {
       fs.rmSync(tempBlobPath, { force: true });
+      const blobReferenced = db
+        .prepare("SELECT 1 FROM versions WHERE blob_path = ?")
+        .get(absBlobPath);
+      if (!blobReferenced) {
+        fs.rmSync(absBlobPath, { force: true });
+      }
       if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
         if (isPendingConflict(err, db, owner.id)) {
           res.status(409).json({
@@ -440,6 +446,7 @@ export function createApp({ db, dataDir, config = {} }) {
              OR json_extract(t.meta_json, '$.description') LIKE ? ESCAPE '\\'
              OR t.id LIKE ? ESCAPE '\\'
              OR t.owner LIKE ? ESCAPE '\\')
+         ORDER BY t.created_at DESC, t.owner ASC, t.id ASC
          LIMIT 10`,
       )
       .all(pattern, pattern, pattern, pattern, pattern, pattern);
