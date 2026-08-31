@@ -73,6 +73,11 @@ export function openDatabase(dataDir) {
   db.pragma("journal_mode = WAL");
   db.exec(SCHEMA);
   migrateSchema(db);
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS versions_one_pending_per_owner
+     ON versions (owner_id)
+     WHERE status IN ('staging', 'pending')`,
+  );
   return db;
 }
 

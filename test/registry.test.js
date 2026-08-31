@@ -202,6 +202,32 @@ describe("warp-registry publish flow", () => {
     );
   });
 
+  test("concurrent publishes for the same unapproved owner with different versions yield one 201 and one 409", async () => {
+    const token = insertOwner(db, "concurrentdiffowner");
+
+    const [a, b] = await Promise.all([
+      publishForVersion(base, token, "0.1.0"),
+      publishForVersion(base, token, "0.2.0"),
+    ]);
+
+    const statuses = [a.status, b.status].sort();
+    assert.deepEqual(statuses, [201, 409]);
+
+    const rejected = a.status === 409 ? a : b;
+    const rejectedBody = await rejected.json();
+    assert.match(rejectedBody.error, /already awaiting review/i);
+
+    const rows = db
+      .prepare(
+        `SELECT v.* FROM versions v JOIN owners o ON o.id = v.owner_id
+         WHERE o.github_username = 'concurrentdiffowner'`,
+      )
+      .all();
+    assert.equal(rows.length, 1, "exactly one version row persisted");
+    assert.equal(rows[0].status, "pending");
+    assert.ok(fs.existsSync(rows[0].blob_path), "blob must exist on disk");
+  });
+
   test("malformed meta returns 400 and never executes the file", async () => {
     const token = insertOwner(db, "malowner");
     const res = await publish(base, token, "malformed-meta.js");

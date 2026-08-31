@@ -45,6 +45,22 @@ export function semverSortKey(version) {
 const semverSortKeyRegistered = new WeakSet();
 
 /**
+ * Detects a violation of the partial unique index that allows at most one
+ * staging or pending version per owner, distinguishing it from the per-version
+ * uniqueness constraint.
+ * @param {unknown} err - The error thrown by better-sqlite3.
+ * @returns {boolean} True if the error is the one-pending-per-owner violation.
+ */
+function isPendingConflict(err) {
+  return (
+    err?.code === "SQLITE_CONSTRAINT_UNIQUE" &&
+    typeof err.message === "string" &&
+    err.message.includes("versions.owner_id") &&
+    !err.message.includes("versions.package_id")
+  );
+}
+
+/**
  * Creates and configures the Express application.
  * Sets up all routes for OAuth, publishing, and serving packages.
  * @param {object} options - Configuration options.
@@ -278,24 +294,6 @@ export function createApp({ db, dataDir, config = {} }) {
       return;
     }
 
-    if (
-      owner.has_published === 0 &&
-      db
-        .prepare(
-          `SELECT id FROM versions WHERE owner_id = ? AND status = 'pending'`,
-        )
-        .get(owner.id)
-    ) {
-      res.status(409).json({
-        error:
-          "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
-      });
-      error(
-        "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
-      );
-      return;
-    }
-
     const status = owner.has_published === 1 ? "published" : "pending";
 
     const absBlobPath = blobPath(dataDir, ownerName, packageId, version);
@@ -307,45 +305,93 @@ export function createApp({ db, dataDir, config = {} }) {
       fs.mkdirSync(path.dirname(absBlobPath), { recursive: true });
       fs.writeFileSync(tempBlobPath, source);
 
-      const stageVersion = db.transaction(() => {
-        db.prepare(
-          `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
-           VALUES (?, ?, ?, 'staging', ?, ?, ?)`,
-        ).run(
-          owner.id,
-          packageId,
-          version,
-          status,
-          JSON.stringify(meta),
-          absBlobPath,
-        );
-      });
+      if (owner.has_published === 1) {
+        db.transaction(() => {
+          db.prepare(
+            `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
+             VALUES (?, ?, ?, 'staging', ?, ?, ?)`,
+          ).run(
+            owner.id,
+            packageId,
+            version,
+            status,
+            JSON.stringify(meta),
+            absBlobPath,
+          );
+          fs.renameSync(tempBlobPath, absBlobPath);
+          db.prepare(
+            `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
+          ).run(status, owner.id, packageId, version);
+        })();
+      } else {
+        const staged = db.transaction(() => {
+          if (
+            db
+              .prepare(
+                `SELECT id FROM versions WHERE owner_id = ? AND status = 'pending'`,
+              )
+              .get(owner.id)
+          ) {
+            return null;
+          }
+          db.prepare(
+            `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
+             VALUES (?, ?, ?, 'staging', ?, ?, ?)`,
+          ).run(
+            owner.id,
+            packageId,
+            version,
+            status,
+            JSON.stringify(meta),
+            absBlobPath,
+          );
+          return true;
+        })();
 
-      try {
-        stageVersion();
-      } catch {
-        fs.rmSync(tempBlobPath, { force: true });
+        if (!staged) {
+          fs.rmSync(tempBlobPath, { force: true });
+          res.status(409).json({
+            error:
+              "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+          });
+          error(
+            "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+          );
+          return;
+        }
+
+        try {
+          fs.renameSync(tempBlobPath, absBlobPath);
+        } catch (err) {
+          db.prepare(
+            `DELETE FROM versions WHERE owner_id = ? AND package_id = ? AND version = ?`,
+          ).run(owner.id, packageId, version);
+          throw err;
+        }
+
+        db.prepare(
+          `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
+        ).run(status, owner.id, packageId, version);
+      }
+    } catch (err) {
+      fs.rmSync(tempBlobPath, { force: true });
+      if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
+        if (isPendingConflict(err)) {
+          res.status(409).json({
+            error:
+              "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+          });
+          error(
+            "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+          );
+          return;
+        }
         res
           .status(409)
           .json({ error: "This version already exists for this owner." });
         error("This version already exists for this owner.");
         return;
       }
-
-      try {
-        fs.renameSync(tempBlobPath, absBlobPath);
-      } catch (err) {
-        db.prepare(
-          `DELETE FROM versions WHERE owner_id = ? AND package_id = ? AND version = ?`,
-        ).run(owner.id, packageId, version);
-        throw err;
-      }
-
-      db.prepare(
-        `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
-      ).run(status, owner.id, packageId, version);
-    } catch (err) {
-      fs.rmSync(tempBlobPath, { force: true });
       next(err);
       return;
     }
