@@ -11,9 +11,7 @@ const DEFAULT_DATA_DIR = path.join(root, "data");
 const [, , username, packageId, version] = process.argv;
 
 if (!username || !packageId || !version) {
-  error(
-    "Usage: node scripts/approve.js <github_username> <package_id> <version>",
-  );
+  error("Usage: node scripts/approve.js <namespace> <package_id> <version>");
   process.exit(1);
 }
 
@@ -21,11 +19,11 @@ const dataDir = path.resolve(process.env.DATA_DIR || DEFAULT_DATA_DIR);
 const db = openDatabase(dataDir);
 
 const owner = db
-  .prepare("SELECT id FROM owners WHERE github_username = ?")
+  .prepare("SELECT id FROM users WHERE namespace = ?")
   .get(username);
 
 if (!owner) {
-  error(`Owner not found: ${username}`);
+  error(`User not found: ${username}`);
   process.exit(1);
 }
 
@@ -40,7 +38,7 @@ const approve = db.transaction(() => {
 
   if (result.changes === 0) return false;
 
-  db.prepare("UPDATE owners SET has_published = 1 WHERE id = ?").run(owner.id);
+  db.prepare("UPDATE users SET has_published = 1 WHERE id = ?").run(owner.id);
 
   db.prepare(
     `DELETE FROM versions

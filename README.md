@@ -6,12 +6,38 @@ Warp Registry is a Node (Express) server similar to a container registry that st
 
 ## Features
 
-- **Publish compiled extensions** — upload artifacts built with Warp Compiler via a simple `POST /v1/publish` endpoint, authenticated with a GitHub OAuth token.
-- **GitHub OAuth auth** — publish tokens are issued once through GitHub's OAuth flow and only ever shown to the owner a single time.
-- **First-publish moderation** — a brand-new owner's first publish is held as `pending` until approved, to keep the registry tamper-resistant.
+- **Username/password accounts** — sign up, log in, and manage your own account. Passwords are hashed server-side with scrypt and never stored in plain text.
+- **Bearer token auth** — every publish and account/extension edit is authenticated with an opaque bearer token issued at signup/login. Tokens can be revoked at any time (logout invalidates the current token; deleting your account revokes all of them).
+- **First-publish moderation** — a brand-new owner's first publish is held as `pending` until an admin approves it, to keep the registry tamper-resistant.
+- **Admin moderation** — admins can approve pending extensions via the API or the CLI approval script.
 - **Semantic versioning** — each package tracks multiple versions per owner, validated against semver rules.
 - **Fetch by package or version** — retrieve a package's info and metadata, download a specific version, or the `latest` release, straight into TurboWarp.
-- **SQLite-backed storage** — owners, versions, and metadata are stored in a WAL-mode SQLite database; compiled blobs live on disk under a configurable data directory.
+- **SQLite-backed storage** — users, tokens, versions, and metadata are stored in a WAL-mode SQLite database; compiled blobs live on disk under a configurable data directory.
+
+## API
+
+The HTTP API is versioned and documented by OpenAPI. The authoritative contract lives in [`openapi/v2.json`](openapi/v2.json). Highlights:
+
+| Method | Path                              | Auth  | Description                                          |
+| ------ | --------------------------------- | ----- | ---------------------------------------------------- |
+| POST   | `/v2/auth/signup`                 | —     | Create an account, get a token                       |
+| POST   | `/v2/auth/login`                  | —     | Log in, get a token                                  |
+| POST   | `/v2/auth/logout`                 | ✓     | Revoke the current token                             |
+| GET    | `/v2/users`                       | —     | List users (paginated)                               |
+| GET    | `/v2/users/{namespace}`           | —     | Read a user                                          |
+| PATCH  | `/v2/users/{namespace}`           | ✓     | Update own user (or any as admin)                    |
+| DELETE | `/v2/users/{namespace}`           | ✓     | Delete own user (or any as admin)                    |
+| POST   | `/v2/publish`                     | ✓     | Publish an extension version                         |
+| GET    | `/v2/@{namespace}/{id}`           | —     | Read an extension                                    |
+| PATCH  | `/v2/@{namespace}/{id}`           | ✓     | Update own extension                                 |
+| DELETE | `/v2/@{namespace}/{id}`           | ✓     | Delete own extension                                 |
+| GET    | `/v2/@{namespace}/{id}/{version}` | —     | Fetch extension source (`latest` resolves to newest) |
+| POST   | `/v2/@{namespace}/{id}/approve`   | admin | Approve a pending extension                          |
+| GET    | `/v2/search?query=...`            | —     | Search published extensions                          |
+| GET    | `/v2/packages`                    | —     | List published packages                              |
+| GET    | `/v2/stats`                       | —     | Registry statistics                                  |
+
+Authentication uses the `Authorization: Bearer <token>` header. Missing or invalid tokens return `401`; authenticated-but-unauthorized access returns `403`.
 
 ## Installation & Usage
 

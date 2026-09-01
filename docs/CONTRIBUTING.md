@@ -100,7 +100,7 @@ reason for it, and any manual testing you performed.
 
 - `src/` — the Express server source.
   - `server.js` — entry point; wires up config, database, and the app.
-  - `routes.js` — HTTP endpoints (OAuth, publish, fetch).
+  - `routes.js` — HTTP endpoints (auth, users, publish, fetch).
   - `db.js` — SQLite schema and helpers.
   - `warp-meta.js` — parses compiled extensions and extracts `Warp.meta`.
   - `logger.js` — small logging helpers.

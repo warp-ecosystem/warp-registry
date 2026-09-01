@@ -10,6 +10,7 @@ import { openDatabase, blobPath } from "../src/db.js";
 import {
   createApp,
   hashToken,
+  hashPassword,
   reconcileStagedVersions,
 } from "../src/routes.js";
 
@@ -32,68 +33,172 @@ async function startServer() {
 }
 
 /**
- * Inserts a new owner into the database and returns a token.
+ * Signs up a user via the API and returns the auth token.
+ * @param {string} base - The base URL of the test server.
+ * @param {string} namespace - The user namespace.
+ * @param {string} [password="testpassword123"] - The password.
+ * @param {string} [displayName=""] - The display name.
+ * @returns {Promise<{token: string, user: object}>} The auth token and user object.
+ */
+async function signup(
+  base,
+  namespace,
+  password = "testpassword123",
+  displayName = "",
+) {
+  const res = await fetch(`${base}/v2/auth/signup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ namespace, password, displayName }),
+  });
+  assert.equal(res.status, 201);
+  const body = await res.json();
+  return { token: body.token, user: body.user };
+}
+
+/**
+ * Inserts a new owner directly into the database and returns a token.
  * @param {import('better-sqlite3').Database} db - The database instance.
- * @param {string} username - The GitHub username.
+ * @param {string} namespace - The user namespace.
+ * @param {boolean} [hasPublished=false] - Whether the user has published before.
  * @returns {string} The generated token.
  */
-function insertOwner(db, username) {
+function insertOwner(db, namespace, hasPublished = false) {
   const token = crypto.randomBytes(32).toString("hex");
   db.prepare(
-    "INSERT INTO owners (github_username, token_hash, has_published) VALUES (?, ?, 0)",
-  ).run(username, hashToken(token));
+    "INSERT INTO users (namespace, display_name, password_hash, type, has_published) VALUES (?, '', ?, 'normal', ?)",
+  ).run(namespace, hashPassword("testpassword123"), hasPublished ? 1 : 0);
+  db.prepare("INSERT INTO auth_tokens (user_id, token_hash) VALUES (?, ?)").run(
+    db.prepare("SELECT id FROM users WHERE namespace = ?").get(namespace).id,
+    hashToken(token),
+  );
   return token;
 }
 
 /**
- * Publishes a fixture file to the test server.
+ * Inserts a brand approved owner (has_published=1) and returns a token.
+ * @param {import('better-sqlite3').Database} db - The database instance.
+ * @param {string} namespace - The user namespace.
+ * @returns {string} The generated token.
+ */
+function insertApprovedOwner(db, namespace) {
+  return insertOwner(db, namespace, true);
+}
+
+/**
+ * Inserts an admin user directly into the database and returns a token.
+ * @param {import('better-sqlite3').Database} db - The database instance.
+ * @param {string} namespace - The admin namespace.
+ * @returns {string} The generated token.
+ */
+function insertAdmin(db, namespace) {
+  const token = crypto.randomBytes(32).toString("hex");
+  db.prepare(
+    "INSERT INTO users (namespace, display_name, password_hash, type, has_published) VALUES (?, '', ?, 'admin', 1)",
+  ).run(namespace, hashPassword("testpassword123"));
+  db.prepare("INSERT INTO auth_tokens (user_id, token_hash) VALUES (?, ?)").run(
+    db.prepare("SELECT id FROM users WHERE namespace = ?").get(namespace).id,
+    hashToken(token),
+  );
+  return token;
+}
+
+/**
+ * Builds a publish body from the helloworld fixture with overrides applied.
+ * @param {object} [overrides] - Field overrides for id, name, description, version.
+ * @returns {object} The publish request body.
+ */
+function buildPublishBody(overrides = {}) {
+  const source = fs
+    .readFileSync(path.join(fixturesDir, "helloworld@0.1.0.js"))
+    .toString()
+    .replace('version: "0.1.0"', `version: "${overrides.version || "0.1.0"}"`)
+    .replace('id: "helloworld"', `id: "${overrides.id || "helloworld"}"`)
+    .replace('name: "It works!"', `name: "${overrides.name || "It works!"}"`)
+    .replace(
+      'description: "A description of the extension."',
+      `description: "${overrides.description || "A description of the extension."}"`,
+    );
+  return {
+    id: overrides.id || "helloworld",
+    meta: {
+      class: "HelloWorld",
+      name: overrides.name || "It works!",
+      id: overrides.id || "helloworld",
+      license: "Apache-2.0",
+      authors: ["test"],
+      description: overrides.description || "A description of the extension.",
+      version: overrides.version || "0.1.0",
+    },
+    extensionBlob: source,
+  };
+}
+
+/**
+ * Publishes to the v2 publish endpoint.
  * @param {string} base - The base URL of the test server.
  * @param {string} token - The authentication token.
- * @param {string} fixture - The fixture filename.
- * @param {string} [contentType="application/javascript"] - The content type header.
+ * @param {object} body - The publish request body.
  * @returns {Promise<Response>} The fetch response.
  */
-function publish(base, token, fixture, contentType = "application/javascript") {
-  const body = fs.readFileSync(path.join(fixturesDir, fixture));
-  return fetch(`${base}/v1/publish`, {
+function publish(base, token, body) {
+  return fetch(`${base}/v2/publish`, {
     method: "POST",
     headers: {
-      "Content-Type": contentType,
+      "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
     },
-    body,
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * Publishes a raw body string to the server.
+ * @param {string} base - The base URL of the test server.
+ * @param {string} token - The authentication token.
+ * @param {object} body - The publish request body.
+ * @returns {Promise<Response>} The fetch response.
+ */
+function publishRaw(base, token, body) {
+  return fetch(`${base}/v2/publish`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(body),
   });
 }
 
 /**
  * Runs the approve script to approve a pending package version.
- * @param {string} username - The owner's username.
+ * @param {string} namespace - The owner's namespace.
  * @param {string} packageId - The package identifier.
  * @param {string} version - The package version.
  * @param {string} dataDir - The data directory path.
  * @returns {string} The script output.
  */
-function approve(username, packageId, version, dataDir) {
+function approve(namespace, packageId, version, dataDir) {
   return execFileSync(
     process.execPath,
-    [path.join(root, "scripts", "approve.js"), username, packageId, version],
+    [path.join(root, "scripts", "approve.js"), namespace, packageId, version],
     { env: { ...process.env, DATA_DIR: dataDir } },
   ).toString();
 }
 
 /**
  * Runs the approve script asynchronously to approve a pending package version.
- * @param {string} username - The owner's username.
+ * @param {string} namespace - The owner's namespace.
  * @param {string} packageId - The package identifier.
  * @param {string} version - The package version.
  * @param {string} dataDir - The data directory path.
  * @returns {Promise<string>} The script output.
  */
-function approveAsync(username, packageId, version, dataDir) {
+function approveAsync(namespace, packageId, version, dataDir) {
   return new Promise((resolve, reject) => {
     execFile(
       process.execPath,
-      [path.join(root, "scripts", "approve.js"), username, packageId, version],
+      [path.join(root, "scripts", "approve.js"), namespace, packageId, version],
       { env: { ...process.env, DATA_DIR: dataDir } },
       (error, stdout, stderr) => {
         if (error) {
@@ -115,7 +220,109 @@ async function closeServer(server) {
   await new Promise((resolve) => server.close(resolve));
 }
 
-describe("warp-registry publish flow", () => {
+/**
+ * Publishes a modified version of the helloworld fixture with a custom version.
+ * @param {string} base - The base URL of the test server.
+ * @param {string} token - The authentication token.
+ * @param {string} version - The version string to use.
+ * @returns {Promise<Response>} The fetch response.
+ */
+async function publishForVersion(base, token, version) {
+  return publish(base, token, buildPublishBody({ version }));
+}
+
+describe("warp-registry v2 auth flow", () => {
+  let server;
+  let base;
+
+  before(async () => {
+    ({ server, base } = await startServer());
+  });
+
+  after(async () => {
+    await closeServer(server);
+  });
+
+  test("signup creates a user and returns token", async () => {
+    const { token, user } = await signup(base, "newuser");
+    assert.ok(token, "token should be returned");
+    assert.equal(user.namespace, "newuser");
+    assert.equal(user.type, "normal");
+    assert.deepEqual(user.extensions, []);
+  });
+
+  test("signup with duplicate namespace returns 409", async () => {
+    await signup(base, "dupuser");
+    const res = await fetch(`${base}/v2/auth/signup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ namespace: "dupuser", password: "password1234" }),
+    });
+    assert.equal(res.status, 409);
+  });
+
+  test("signup with short password returns 400", async () => {
+    const res = await fetch(`${base}/v2/auth/signup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ namespace: "shortpw", password: "short" }),
+    });
+    assert.equal(res.status, 400);
+  });
+
+  test("signup with invalid namespace returns 400", async () => {
+    const res = await fetch(`${base}/v2/auth/signup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ namespace: "INVALID!", password: "password1234" }),
+    });
+    assert.equal(res.status, 400);
+  });
+
+  test("login with valid credentials returns token", async () => {
+    await signup(base, "logintest", "mypassword123");
+    const res = await fetch(`${base}/v2/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        namespace: "logintest",
+        password: "mypassword123",
+      }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.ok(body.token);
+    assert.equal(body.user.namespace, "logintest");
+  });
+
+  test("login with wrong password returns 401", async () => {
+    await signup(base, "wrongpw", "mypassword123");
+    const res = await fetch(`${base}/v2/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ namespace: "wrongpw", password: "wrongpassword" }),
+    });
+    assert.equal(res.status, 401);
+  });
+
+  test("logout revokes token", async () => {
+    const { token } = await signup(base, "logouttest");
+    const logoutRes = await fetch(`${base}/v2/auth/logout`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(logoutRes.status, 200);
+
+    const publishRes = await publish(
+      base,
+      token,
+      buildPublishBody({ id: "testpkg" }),
+    );
+    assert.equal(publishRes.status, 401);
+  });
+});
+
+describe("warp-registry v2 publish flow", () => {
   let server;
   let dataDir;
   let db;
@@ -134,19 +341,18 @@ describe("warp-registry publish flow", () => {
   test("publishing for a brand-new owner results in status pending and 404 on info", async () => {
     const token = insertOwner(db, "pendingowner");
     pendingOwnerToken = token;
-    const res = await publish(base, token, "helloworld@0.1.0.js");
+    const res = await publish(base, token, buildPublishBody());
     assert.equal(res.status, 201);
     const body = await res.json();
-    assert.equal(body.owner, "pendingowner");
-    assert.equal(body.id, "helloworld");
-    assert.equal(body.version, "0.1.0");
-    assert.equal(body.status, "pending");
-    assert.equal(body.url, "/v1/pendingowner/helloworld/0.1.0");
+    assert.equal(body.extension.owner, "pendingowner");
+    assert.equal(body.extension.id, "helloworld");
+    assert.equal(body.extension.approved, false);
+    assert.equal(body.publishedUrl, "/v2/@pendingowner/helloworld");
 
     const row = db
       .prepare(
-        `SELECT v.* FROM versions v JOIN owners o ON o.id = v.owner_id
-         WHERE o.github_username = 'pendingowner'`,
+        `SELECT v.* FROM versions v JOIN users u ON u.id = v.owner_id
+         WHERE u.namespace = 'pendingowner'`,
       )
       .get();
     assert.equal(row.status, "pending");
@@ -156,17 +362,17 @@ describe("warp-registry publish flow", () => {
     );
     assert.ok(fs.existsSync(row.blob_path));
 
-    const infoRes = await fetch(`${base}/v1/pendingowner/helloworld`);
+    const infoRes = await fetch(`${base}/v2/@pendingowner/helloworld`);
     assert.equal(infoRes.status, 404);
 
-    const blobRes = await fetch(`${base}/v1/pendingowner/helloworld/0.1.0`);
+    const blobRes = await fetch(`${base}/v2/@pendingowner/helloworld/0.1.0`);
     assert.equal(blobRes.status, 404);
   });
 
   test("after approve, re-publish is immediately published", async () => {
     approve("pendingowner", "helloworld", "0.1.0", dataDir);
 
-    const res = await publish(base, pendingOwnerToken, "helloworld@0.1.0.js");
+    const res = await publish(base, pendingOwnerToken, buildPublishBody());
     assert.equal(res.status, 409);
     assert.equal((await res.json()).error.includes("already exists"), true);
 
@@ -177,30 +383,30 @@ describe("warp-registry publish flow", () => {
     );
     assert.equal(publishRes.status, 201);
     const body = await publishRes.json();
-    assert.equal(body.status, "published");
+    assert.equal(body.extension.approved, true);
 
-    const infoRes = await fetch(`${base}/v1/pendingowner/helloworld`);
+    const infoRes = await fetch(`${base}/v2/@pendingowner/helloworld`);
     assert.equal(infoRes.status, 200);
     const info = await infoRes.json();
-    assert.equal(info.latestVersion, "0.1.1");
     assert.deepEqual(info.versions, ["0.1.1", "0.1.0"]);
   });
 
   test("publishing same (owner, id, version) twice returns 409", async () => {
     const token = insertOwner(db, "dupowner");
-    const first = await publish(base, token, "helloworld@0.1.0.js");
+    const first = await publish(base, token, buildPublishBody());
     assert.equal(first.status, 201);
 
-    const second = await publish(base, token, "helloworld@0.1.0.js");
+    const second = await publish(base, token, buildPublishBody());
     assert.equal(second.status, 409);
   });
 
   test("concurrent publishes for the same version yield one 201 and one 409", async () => {
     const token = insertOwner(db, "concurrentowner");
+    const body = buildPublishBody();
 
     const [a, b] = await Promise.all([
-      publish(base, token, "helloworld@0.1.0.js"),
-      publish(base, token, "helloworld@0.1.0.js"),
+      publish(base, token, body),
+      publish(base, token, body),
     ]);
 
     const statuses = [a.status, b.status].sort();
@@ -208,8 +414,8 @@ describe("warp-registry publish flow", () => {
 
     const rows = db
       .prepare(
-        `SELECT v.* FROM versions v JOIN owners o ON o.id = v.owner_id
-         WHERE o.github_username = 'concurrentowner'`,
+        `SELECT v.* FROM versions v JOIN users u ON u.id = v.owner_id
+         WHERE u.namespace = 'concurrentowner'`,
       )
       .all();
     assert.equal(rows.length, 1, "exactly one persisted version row");
@@ -229,7 +435,7 @@ describe("warp-registry publish flow", () => {
 
   test("concurrent same version publish is reported as a duplicate-version conflict, not an owner-level conflict", async () => {
     const token = insertOwner(db, "concurrentdupver");
-    const body = fs.readFileSync(path.join(fixturesDir, "helloworld@0.1.0.js"));
+    const bodyData = buildPublishBody();
     const encoder = new TextEncoder();
 
     const makeStreamedPublish = () => {
@@ -237,14 +443,14 @@ describe("warp-registry publish flow", () => {
       const bodyReady = new Promise((r) => (finishBody = r));
       const stream = new ReadableStream({
         start(controller) {
-          controller.enqueue(encoder.encode(body));
+          controller.enqueue(encoder.encode(JSON.stringify(bodyData)));
           bodyReady.then(() => controller.close());
         },
       });
-      const req = fetch(`${base}/v1/publish`, {
+      const req = fetch(`${base}/v2/publish`, {
         method: "POST",
         headers: {
-          "Content-Type": "application/javascript",
+          "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
         body: stream,
@@ -287,8 +493,8 @@ describe("warp-registry publish flow", () => {
 
     const rows = db
       .prepare(
-        `SELECT v.* FROM versions v JOIN owners o ON o.id = v.owner_id
-         WHERE o.github_username = 'concurrentdiffowner'`,
+        `SELECT v.* FROM versions v JOIN users u ON u.id = v.owner_id
+         WHERE u.namespace = 'concurrentdiffowner'`,
       )
       .all();
     assert.equal(rows.length, 1, "exactly one version row persisted");
@@ -298,10 +504,27 @@ describe("warp-registry publish flow", () => {
 
   test("malformed meta returns 400 and never executes the file", async () => {
     const token = insertOwner(db, "malowner");
-    const res = await publish(base, token, "malformed-meta.js");
+    const source = fs.readFileSync(
+      path.join(fixturesDir, "malformed-meta.js"),
+      "utf8",
+    );
+    const body = {
+      id: "malpkg",
+      meta: {
+        class: "Test",
+        name: "Test",
+        id: "malpkg",
+        license: "MIT",
+        authors: ["test"],
+        description: "test",
+        version: "0.1.0",
+      },
+      extensionBlob: source,
+    };
+    const res = await publish(base, token, body);
     assert.equal(res.status, 400);
-    const body = await res.json();
-    assert.match(body.error, /static literal/i);
+    const resBody = await res.json();
+    assert.match(resBody.error, /static literal/i);
 
     assert.equal(
       Object.prototype.hasOwnProperty.call(
@@ -314,7 +537,7 @@ describe("warp-registry publish flow", () => {
 
     const count = db
       .prepare(
-        "SELECT COUNT(*) AS c FROM versions WHERE owner_id = (SELECT id FROM owners WHERE github_username='malowner')",
+        "SELECT COUNT(*) AS c FROM versions WHERE owner_id = (SELECT id FROM users WHERE namespace='malowner')",
       )
       .get().c;
     assert.equal(count, 0);
@@ -325,35 +548,27 @@ describe("warp-registry publish flow", () => {
     const dataDirFor = dataDir;
 
     const publishVersion = async (version) => {
-      const body = fs
-        .readFileSync(path.join(fixturesDir, "helloworld@0.1.0.js"))
-        .toString()
-        .replace('version: "0.1.0"', `version: "${version}"`)
-        .replace('id: "helloworld"', 'id: "semverpkg"');
-      const res = await fetch(`${base}/v1/publish`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/javascript",
-          Authorization: `Bearer ${token}`,
-        },
-        body,
-      });
+      const res = await publish(
+        base,
+        token,
+        buildPublishBody({ id: "semverpkg", version }),
+      );
       assert.equal(res.status, 201);
       const outer = await res.json();
-      if (outer.status === "pending") {
-        approve(outer.owner, outer.id, outer.version, dataDirFor);
+      if (!outer.extension.approved) {
+        approve(outer.extension.owner, outer.extension.id, version, dataDirFor);
       }
     };
 
     await publishVersion("2.0.0");
     await publishVersion("10.0.0");
 
-    const infoRes = await fetch(`${base}/v1/semverowner/semverpkg`);
+    const infoRes = await fetch(`${base}/v2/@semverowner/semverpkg`);
     assert.equal(infoRes.status, 200);
     const info = await infoRes.json();
-    assert.equal(info.latestVersion, "10.0.0");
+    assert.deepEqual(info.versions, ["10.0.0", "2.0.0"]);
 
-    const latestRes = await fetch(`${base}/v1/semverowner/semverpkg/latest`);
+    const latestRes = await fetch(`${base}/v2/@semverowner/semverpkg/latest`);
     assert.equal(latestRes.status, 200);
     const latestBody = await latestRes.text();
     assert.match(latestBody, /"10\.0\.0"/);
@@ -363,54 +578,62 @@ describe("warp-registry publish flow", () => {
     const res = await publish(
       base,
       "definitely-not-a-valid-token",
-      "helloworld@0.1.0.js",
+      buildPublishBody(),
     );
     assert.equal(res.status, 401);
   });
 
   test("non-semver meta.version is rejected with 400 and never persisted", async () => {
     const token = insertOwner(db, "badversionowner");
-    const body = fs
-      .readFileSync(path.join(fixturesDir, "helloworld@0.1.0.js"))
-      .toString()
-      .replace('version: "0.1.0"', 'version: "not-a-version"');
-    const res = await fetch(`${base}/v1/publish`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/javascript",
-        Authorization: `Bearer ${token}`,
-      },
-      body,
-    });
+    const body = buildPublishBody({ id: "badverpkg" });
+    body.meta.version = "not-a-version";
+    body.extensionBlob = body.extensionBlob.replace(
+      'version: "0.1.0"',
+      'version: "not-a-version"',
+    );
+    const res = await publish(base, token, body);
     assert.equal(res.status, 400);
     const parsed = await res.json();
     assert.match(parsed.error, /valid semver/i);
 
     const count = db
       .prepare(
-        "SELECT COUNT(*) AS c FROM versions WHERE owner_id = (SELECT id FROM owners WHERE github_username='badversionowner')",
+        "SELECT COUNT(*) AS c FROM versions WHERE owner_id = (SELECT id FROM users WHERE namespace='badversionowner')",
       )
       .get().c;
     assert.equal(count, 0);
-    assert.equal(
-      fs.existsSync(
-        blobPath(dataDir, "badversionowner", "helloworld", "not-a-version"),
-      ),
-      false,
-      "blob must not be written to disk for an invalid version",
-    );
   });
 
   test("nested Warp declaration inside a function is rejected with 400", async () => {
     const token = insertOwner(db, "nestedwarpowner");
-    const res = await publish(base, token, "nested-warp.js");
+    const source = fs.readFileSync(
+      path.join(fixturesDir, "nested-warp.js"),
+      "utf8",
+    );
+    const body = {
+      id: "nestedpkg",
+      meta: {
+        class: "Test",
+        name: "Test",
+        id: "nestedpkg",
+        license: "MIT",
+        authors: ["test"],
+        description: "test",
+        version: "0.1.0",
+      },
+      extensionBlob: source,
+    };
+    const res = await publish(base, token, body);
     assert.equal(res.status, 400);
-    const body = await res.json();
-    assert.match(body.error, /No\s+`const Warp`\s+object declaration found/i);
+    const resBody = await res.json();
+    assert.match(
+      resBody.error,
+      /No\s+`const Warp`\s+object declaration found/i,
+    );
 
     const count = db
       .prepare(
-        "SELECT COUNT(*) AS c FROM versions WHERE owner_id = (SELECT id FROM owners WHERE github_username='nestedwarpowner')",
+        "SELECT COUNT(*) AS c FROM versions WHERE owner_id = (SELECT id FROM users WHERE namespace='nestedwarpowner')",
       )
       .get().c;
     assert.equal(count, 0);
@@ -418,10 +641,10 @@ describe("warp-registry publish flow", () => {
 
   test("reconcile does not publish an unapproved version when another is approved", async () => {
     const token = insertOwner(db, "reconcileowner");
-    const a = await publish(base, token, "helloworld@0.1.0.js");
+    const a = await publish(base, token, buildPublishBody());
     assert.equal(a.status, 201);
     const bodyA = await a.json();
-    assert.equal(bodyA.status, "pending");
+    assert.equal(bodyA.extension.approved, false);
 
     const b = await publishForVersion(base, token, "0.2.0");
     assert.equal(b.status, 409);
@@ -434,8 +657,8 @@ describe("warp-registry publish flow", () => {
     const rows = db
       .prepare(
         `SELECT v.version, v.status FROM versions v
-         JOIN owners o ON o.id = v.owner_id
-         WHERE o.github_username = 'reconcileowner' ORDER BY v.version`,
+         JOIN users u ON u.id = v.owner_id
+         WHERE u.namespace = 'reconcileowner' ORDER BY v.version`,
       )
       .all();
     assert.deepEqual(rows, [{ version: "0.1.0", status: "published" }]);
@@ -443,22 +666,22 @@ describe("warp-registry publish flow", () => {
 
   test("reconcile finalizes a staging row whose blob became durable", async () => {
     const token = insertOwner(db, "stagingowner");
-    const res = await publish(base, token, "helloworld@0.1.0.js");
+    const res = await publish(base, token, buildPublishBody());
     assert.equal(res.status, 201);
     const body = await res.json();
-    assert.equal(body.status, "pending");
+    assert.equal(body.extension.approved, false);
 
     db.prepare(
       `UPDATE versions SET status = 'staging', final_status = 'published'
-       WHERE owner_id = (SELECT id FROM owners WHERE github_username = 'stagingowner')`,
+       WHERE owner_id = (SELECT id FROM users WHERE namespace = 'stagingowner')`,
     ).run();
     reconcileStagedVersions(db, dataDir);
 
     const row = db
       .prepare(
         `SELECT v.status FROM versions v
-         JOIN owners o ON o.id = v.owner_id
-         WHERE o.github_username = 'stagingowner'`,
+         JOIN users u ON u.id = v.owner_id
+         WHERE u.namespace = 'stagingowner'`,
       )
       .get();
     assert.equal(row.status, "published");
@@ -466,19 +689,19 @@ describe("warp-registry publish flow", () => {
 
   test("reconcile deletes a staging row whose blob never became durable", async () => {
     const token = insertOwner(db, "stagingmissingowner");
-    const res = await publish(base, token, "helloworld@0.1.0.js");
+    const res = await publish(base, token, buildPublishBody());
     assert.equal(res.status, 201);
 
     fs.rmSync(blobPath(dataDir, "stagingmissingowner", "helloworld", "0.1.0"));
     db.prepare(
       `UPDATE versions SET status = 'staging'
-       WHERE owner_id = (SELECT id FROM owners WHERE github_username = 'stagingmissingowner')`,
+       WHERE owner_id = (SELECT id FROM users WHERE namespace = 'stagingmissingowner')`,
     ).run();
     reconcileStagedVersions(db, dataDir);
 
     const count = db
       .prepare(
-        "SELECT COUNT(*) AS c FROM versions WHERE owner_id = (SELECT id FROM owners WHERE github_username='stagingmissingowner')",
+        "SELECT COUNT(*) AS c FROM versions WHERE owner_id = (SELECT id FROM users WHERE namespace='stagingmissingowner')",
       )
       .get().c;
     assert.equal(count, 0);
@@ -486,7 +709,7 @@ describe("warp-registry publish flow", () => {
 
   test("approval does not miss a version during an in-flight staging->pending transition", async () => {
     const token = insertOwner(db, "transitionowner");
-    const res = await publish(base, token, "helloworld@0.1.0.js");
+    const res = await publish(base, token, buildPublishBody());
     assert.equal(res.status, 201);
 
     assert.ok(
@@ -496,16 +719,12 @@ describe("warp-registry publish flow", () => {
       "blob must be durable during the transition window",
     );
 
-    // A second connection holds the write lock with the transition in flight:
-    // the blob is already durable but the row is still 'staging' (final
-    // status 'pending'), exactly the state between the blob rename and the
-    // status flip. Approval must be mutually exclusive with this transition.
     const other = openDatabase(dataDir);
     other.exec("BEGIN IMMEDIATE");
     other
       .prepare(
         `UPDATE versions SET status = 'staging', final_status = 'pending'
-         WHERE owner_id = (SELECT id FROM owners WHERE github_username = 'transitionowner')`,
+         WHERE owner_id = (SELECT id FROM users WHERE namespace = 'transitionowner')`,
       )
       .run();
 
@@ -517,7 +736,7 @@ describe("warp-registry publish flow", () => {
     other
       .prepare(
         `UPDATE versions SET status = 'pending'
-         WHERE owner_id = (SELECT id FROM owners WHERE github_username = 'transitionowner')`,
+         WHERE owner_id = (SELECT id FROM users WHERE namespace = 'transitionowner')`,
       )
       .run();
     other.exec("COMMIT");
@@ -528,8 +747,8 @@ describe("warp-registry publish flow", () => {
     const rows = db
       .prepare(
         `SELECT v.status FROM versions v
-         JOIN owners o ON o.id = v.owner_id
-         WHERE o.github_username = 'transitionowner'`,
+         JOIN users u ON u.id = v.owner_id
+         WHERE u.namespace = 'transitionowner'`,
       )
       .all();
     assert.deepEqual(rows, [{ status: "published" }]);
@@ -539,40 +758,36 @@ describe("warp-registry publish flow", () => {
     const token = insertOwner(db, "raceowner");
     db.prepare(
       `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
-       VALUES ((SELECT id FROM owners WHERE github_username = 'raceowner'),
+       VALUES ((SELECT id FROM users WHERE namespace = 'raceowner'),
                'pkga', '0.1.0', 'pending', 'pending', '{}', '/tmp/nonexistent')`,
     ).run();
 
-    const body = buildCustomBody({ id: "pkgb", version: "0.1.0" });
+    const bodyData = buildPublishBody({ id: "pkgb", version: "0.1.0" });
     const encoder = new TextEncoder();
     let finishBody;
     const bodyReady = new Promise((r) => (finishBody = r));
     const stream = new ReadableStream({
       start(controller) {
-        controller.enqueue(encoder.encode(body));
+        controller.enqueue(encoder.encode(JSON.stringify(bodyData)));
         bodyReady.then(() => controller.close());
       },
     });
 
-    // Stream the request body so the publish handler reads the owner
-    // (has_published=0) and then parks awaiting readRawBody.
-    const publishing = fetch(`${base}/v1/publish`, {
+    const publishing = fetch(`${base}/v2/publish`, {
       method: "POST",
       headers: {
-        "Content-Type": "application/javascript",
+        "Content-Type": "application/json",
         Authorization: `Bearer ${token}`,
       },
       body: stream,
       duplex: "half",
     });
 
-    // While the handler is parked, approval completes: the pending version is
-    // published and the owner becomes approved.
     await new Promise((r) => setTimeout(r, 120));
     assert.equal(
       db
         .prepare(
-          "SELECT has_published FROM owners WHERE github_username = 'raceowner'",
+          "SELECT has_published FROM users WHERE namespace = 'raceowner'",
         )
         .get().has_published,
       0,
@@ -580,82 +795,31 @@ describe("warp-registry publish flow", () => {
     );
     db.prepare(
       `UPDATE versions SET status = 'published'
-       WHERE owner_id = (SELECT id FROM owners WHERE github_username = 'raceowner')
+       WHERE owner_id = (SELECT id FROM users WHERE namespace = 'raceowner')
          AND package_id = 'pkga'`,
     ).run();
     db.prepare(
-      `UPDATE owners SET has_published = 1 WHERE github_username = 'raceowner'`,
+      `UPDATE users SET has_published = 1 WHERE namespace = 'raceowner'`,
     ).run();
     finishBody();
 
     const res = await publishing;
     assert.equal(res.status, 201);
     const body2 = await res.json();
-    assert.equal(body2.status, "published");
+    assert.equal(body2.extension.approved, true);
 
     const rows = db
       .prepare(
         `SELECT v.status FROM versions v
-         JOIN owners o ON o.id = v.owner_id
-         WHERE o.github_username = 'raceowner' AND v.package_id = 'pkgb'`,
+         JOIN users u ON u.id = v.owner_id
+         WHERE u.namespace = 'raceowner' AND v.package_id = 'pkgb'`,
       )
       .all();
     assert.deepEqual(rows, [{ status: "published" }]);
   });
 });
 
-/**
- * Inserts a brand approved owner (has_published=1) and returns a token.
- * @param {import('better-sqlite3').Database} db - The database instance.
- * @param {string} username - The GitHub username.
- * @returns {string} The generated token.
- */
-function insertApprovedOwner(db, username) {
-  const token = crypto.randomBytes(32).toString("hex");
-  db.prepare(
-    "INSERT INTO owners (github_username, token_hash, has_published) VALUES (?, ?, 1)",
-  ).run(username, hashToken(token));
-  return token;
-}
-
-/**
- * Builds a publish body from the helloworld fixture with overrides applied.
- * @param {object} [overrides] - Field overrides for id, name, description, version.
- * @returns {string} The publish body.
- */
-function buildCustomBody(overrides = {}) {
-  let body = fs
-    .readFileSync(path.join(fixturesDir, "helloworld@0.1.0.js"))
-    .toString()
-    .replace('version: "0.1.0"', `version: "${overrides.version || "0.1.0"}"`)
-    .replace('id: "helloworld"', `id: "${overrides.id || "helloworld"}"`)
-    .replace('name: "It works!"', `name: "${overrides.name || "It works!"}"`)
-    .replace(
-      'description: "A description of the extension."',
-      `description: "${overrides.description || "A description of the extension."}"`,
-    );
-  return body;
-}
-
-/**
- * Publishes a raw body string to the server.
- * @param {string} base - The base URL of the test server.
- * @param {string} token - The authentication token.
- * @param {string} body - The request body.
- * @returns {Promise<Response>} The fetch response.
- */
-function publishRaw(base, token, body) {
-  return fetch(`${base}/v1/publish`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/javascript",
-      Authorization: `Bearer ${token}`,
-    },
-    body,
-  });
-}
-
-describe("warp-registry search endpoint", () => {
+describe("warp-registry v2 search endpoint", () => {
   let server;
   let db;
   let base;
@@ -667,7 +831,7 @@ describe("warp-registry search endpoint", () => {
     await publishRaw(
       base,
       nameToken,
-      buildCustomBody({
+      buildPublishBody({
         id: "namesearch",
         name: "ZebraWidget",
         description: "a widget for tests",
@@ -678,7 +842,7 @@ describe("warp-registry search endpoint", () => {
     await publishRaw(
       base,
       idToken,
-      buildCustomBody({
+      buildPublishBody({
         id: "unicornpkg",
         name: "Whatever",
         description: "another package",
@@ -689,14 +853,14 @@ describe("warp-registry search endpoint", () => {
     await publishRaw(
       base,
       ownerToken,
-      buildCustomBody({ id: "pkgx", name: "Whatever Two" }),
+      buildPublishBody({ id: "pkgx", name: "Whatever Two" }),
     );
 
     const descToken = insertApprovedOwner(db, "descowner");
     await publishRaw(
       base,
       descToken,
-      buildCustomBody({
+      buildPublishBody({
         id: "pkgy",
         name: "Whatever Three",
         description: "purplebanana",
@@ -707,9 +871,9 @@ describe("warp-registry search endpoint", () => {
     await publishRaw(
       base,
       unicodeToken,
-      buildCustomBody({
+      buildPublishBody({
         id: "opiesearch",
-        name: "ÆnigmaWidget",
+        name: "\u00C6nigmaWidget",
         description: "unicode name",
       }),
     );
@@ -718,19 +882,19 @@ describe("warp-registry search endpoint", () => {
     await publishRaw(
       base,
       multiverToken,
-      buildCustomBody({ id: "mypkg", name: "MultiVersion", version: "0.1.0" }),
+      buildPublishBody({ id: "mypkg", name: "MultiVersion", version: "0.1.0" }),
     );
     await publishRaw(
       base,
       multiverToken,
-      buildCustomBody({ id: "mypkg", name: "MultiVersion", version: "0.2.0" }),
+      buildPublishBody({ id: "mypkg", name: "MultiVersion", version: "0.2.0" }),
     );
 
     const sharpSToken = insertApprovedOwner(db, "sharpssowner");
     await publishRaw(
       base,
       sharpSToken,
-      buildCustomBody({
+      buildPublishBody({
         id: "sharppkg",
         name: "Stra\u00DFe",
         description: "German sharp s package",
@@ -741,7 +905,7 @@ describe("warp-registry search endpoint", () => {
     await publishRaw(
       base,
       longSToken,
-      buildCustomBody({
+      buildPublishBody({
         id: "longspkg",
         name: "Ma\u017Fs",
         description: "Latin long s package",
@@ -752,7 +916,7 @@ describe("warp-registry search endpoint", () => {
     await publishRaw(
       base,
       pendingToken,
-      buildCustomBody({
+      buildPublishBody({
         id: "pkgpending",
         name: "PineappleExpress",
         description: "pending only",
@@ -766,18 +930,18 @@ describe("warp-registry search endpoint", () => {
   });
 
   test("empty or missing q returns 400", async () => {
-    const missing = await fetch(`${base}/v1/search`);
+    const missing = await fetch(`${base}/v2/search`);
     assert.equal(missing.status, 400);
 
-    const empty = await fetch(`${base}/v1/search?q=`);
+    const empty = await fetch(`${base}/v2/search?query=`);
     assert.equal(empty.status, 400);
 
-    const blank = await fetch(`${base}/v1/search?q=%20%20`);
+    const blank = await fetch(`${base}/v2/search?query=%20%20`);
     assert.equal(blank.status, 400);
   });
 
   test("search matches on display name (case-insensitive)", async () => {
-    const res = await fetch(`${base}/v1/search?q=zebrawidget`);
+    const res = await fetch(`${base}/v2/search?query=zebrawidget`);
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.deepEqual(
@@ -788,7 +952,7 @@ describe("warp-registry search endpoint", () => {
 
   test("search matches on display name with non-ASCII case folding", async () => {
     const res = await fetch(
-      `${base}/v1/search?q=${encodeURIComponent("ænigmawidget")}`,
+      `${base}/v2/search?query=${encodeURIComponent("\u00E6nigmawidget")}`,
     );
     assert.equal(res.status, 200);
     const body = await res.json();
@@ -800,7 +964,7 @@ describe("warp-registry search endpoint", () => {
 
   test("search matches ß-expanded names via full Unicode case folding", async () => {
     const lower = await fetch(
-      `${base}/v1/search?q=${encodeURIComponent("strasse")}`,
+      `${base}/v2/search?query=${encodeURIComponent("strasse")}`,
     );
     assert.equal(lower.status, 200);
     const lowerBody = await lower.json();
@@ -811,7 +975,7 @@ describe("warp-registry search endpoint", () => {
     );
 
     const upper = await fetch(
-      `${base}/v1/search?q=${encodeURIComponent("STRASSE")}`,
+      `${base}/v2/search?query=${encodeURIComponent("STRASSE")}`,
     );
     assert.equal(upper.status, 200);
     const upperBody = await upper.json();
@@ -822,7 +986,7 @@ describe("warp-registry search endpoint", () => {
     );
 
     const direct = await fetch(
-      `${base}/v1/search?q=${encodeURIComponent("Straße")}`,
+      `${base}/v2/search?query=${encodeURIComponent("Straße")}`,
     );
     assert.equal(direct.status, 200);
     const directBody = await direct.json();
@@ -835,7 +999,7 @@ describe("warp-registry search endpoint", () => {
 
   test("search matches names containing U+017F (long s) via full case folding", async () => {
     const stdForm = await fetch(
-      `${base}/v1/search?q=${encodeURIComponent("mass")}`,
+      `${base}/v2/search?query=${encodeURIComponent("mass")}`,
     );
     assert.equal(stdForm.status, 200);
     const stdBody = await stdForm.json();
@@ -846,7 +1010,7 @@ describe("warp-registry search endpoint", () => {
     );
 
     const direct = await fetch(
-      `${base}/v1/search?q=${encodeURIComponent("Ma\u017Fs")}`,
+      `${base}/v2/search?query=${encodeURIComponent("Ma\u017Fs")}`,
     );
     assert.equal(direct.status, 200);
     const directBody = await direct.json();
@@ -858,7 +1022,7 @@ describe("warp-registry search endpoint", () => {
   });
 
   test("search matches on package_id", async () => {
-    const res = await fetch(`${base}/v1/search?q=unicornpkg`);
+    const res = await fetch(`${base}/v2/search?query=unicornpkg`);
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.deepEqual(
@@ -867,8 +1031,8 @@ describe("warp-registry search endpoint", () => {
     );
   });
 
-  test("search matches on owner github_username", async () => {
-    const res = await fetch(`${base}/v1/search?q=ownerhunt`);
+  test("search matches on owner namespace", async () => {
+    const res = await fetch(`${base}/v2/search?query=ownerhunt`);
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.deepEqual(
@@ -878,7 +1042,7 @@ describe("warp-registry search endpoint", () => {
   });
 
   test("search matches on description", async () => {
-    const res = await fetch(`${base}/v1/search?q=purplebanana`);
+    const res = await fetch(`${base}/v2/search?query=purplebanana`);
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.deepEqual(
@@ -888,14 +1052,14 @@ describe("warp-registry search endpoint", () => {
   });
 
   test("search does not return a pending package even if its name matches", async () => {
-    const res = await fetch(`${base}/v1/search?q=PineappleExpress`);
+    const res = await fetch(`${base}/v2/search?query=PineappleExpress`);
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.deepEqual(body.results, []);
   });
 
   test("search never returns duplicates for a package with multiple published versions", async () => {
-    const res = await fetch(`${base}/v1/search?q=multiversion`);
+    const res = await fetch(`${base}/v2/search?query=multiversion`);
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.results.length, 1);
@@ -909,7 +1073,7 @@ describe("warp-registry search endpoint", () => {
       const res = await publishRaw(
         base,
         token,
-        buildCustomBody({ id: "backportpkg", version }),
+        buildPublishBody({ id: "backportpkg", version }),
       );
       assert.equal(res.status, 201);
     };
@@ -917,7 +1081,7 @@ describe("warp-registry search endpoint", () => {
     await publishVersion("2.0.0");
     await publishVersion("1.5.1");
 
-    const searchRes = await fetch(`${base}/v1/search?q=backportpkg`);
+    const searchRes = await fetch(`${base}/v2/search?query=backportpkg`);
     assert.equal(searchRes.status, 200);
     const searchBody = await searchRes.json();
     assert.equal(searchBody.results.length, 1);
@@ -927,18 +1091,14 @@ describe("warp-registry search endpoint", () => {
       "lower version published later must not supersede the higher version",
     );
 
-    const infoRes = await fetch(`${base}/v1/backportowner/backportpkg`);
+    const infoRes = await fetch(`${base}/v2/@backportowner/backportpkg`);
     assert.equal(infoRes.status, 200);
     const info = await infoRes.json();
-    assert.equal(
-      info.latestVersion,
-      "2.0.0",
-      "GET /v1/:owner/:id stays consistent with discovery",
-    );
+    assert.deepEqual(info.versions, ["2.0.0", "1.5.1"]);
   });
 });
 
-describe("warp-registry semver precedence in discovery routes", () => {
+describe("warp-registry v2 semver precedence in discovery routes", () => {
   let server;
   let db;
   let base;
@@ -949,7 +1109,7 @@ describe("warp-registry semver precedence in discovery routes", () => {
     const setCreatedAt = (owner, id, version, createdAt) => {
       db.prepare(
         `UPDATE versions SET created_at = ?
-         WHERE owner_id = (SELECT id FROM owners WHERE github_username = ?)
+         WHERE owner_id = (SELECT id FROM users WHERE namespace = ?)
            AND package_id = ? AND version = ?`,
       ).run(createdAt, owner, id, version);
     };
@@ -959,7 +1119,7 @@ describe("warp-registry semver precedence in discovery routes", () => {
       const res = await publishRaw(
         base,
         token,
-        buildCustomBody({ id: pkgId, name: pkgId, version }),
+        buildPublishBody({ id: pkgId, name: pkgId, version }),
       );
       assert.equal(res.status, 201);
     };
@@ -1012,13 +1172,13 @@ describe("warp-registry semver precedence in discovery routes", () => {
 
   async function latestFromSearchAndPackages(pkgId) {
     const searchRes = await fetch(
-      `${base}/v1/search?q=${encodeURIComponent(pkgId)}`,
+      `${base}/v2/search?query=${encodeURIComponent(pkgId)}`,
     );
     assert.equal(searchRes.status, 200);
     const searchBody = await searchRes.json();
     const searchMatch = searchBody.results.find((r) => r.id === pkgId);
 
-    const packagesRes = await fetch(`${base}/v1/packages?limit=50`);
+    const packagesRes = await fetch(`${base}/v2/packages?limit=50`);
     assert.equal(packagesRes.status, 200);
     const packagesBody = await packagesRes.json();
     const packagesMatch = packagesBody.packages.find((p) => p.id === pkgId);
@@ -1052,7 +1212,7 @@ describe("warp-registry semver precedence in discovery routes", () => {
   });
 });
 
-describe("warp-registry search LIKE escaping", () => {
+describe("warp-registry v2 search LIKE escaping", () => {
   let server;
   let db;
   let base;
@@ -1064,28 +1224,28 @@ describe("warp-registry search LIKE escaping", () => {
     await publishRaw(
       base,
       underscoreToken,
-      buildCustomBody({ id: "foo_bar", name: "Foo Bar" }),
+      buildPublishBody({ id: "foo_bar", name: "Foo Bar" }),
     );
 
     const wildcardishToken = insertApprovedOwner(db, "usowner2");
     await publishRaw(
       base,
       wildcardishToken,
-      buildCustomBody({ id: "fooxbar", name: "Foo X Bar" }),
+      buildPublishBody({ id: "fooxbar", name: "Foo X Bar" }),
     );
 
     const percentToken = insertApprovedOwner(db, "pctowner");
     await publishRaw(
       base,
       percentToken,
-      buildCustomBody({ id: "pctpkg1", description: "100%guaranteed" }),
+      buildPublishBody({ id: "pctpkg1", description: "100%guaranteed" }),
     );
 
     const wildcardPctToken = insertApprovedOwner(db, "pctowner2");
     await publishRaw(
       base,
       wildcardPctToken,
-      buildCustomBody({ id: "pctpkg2", description: "100x guaranteed" }),
+      buildPublishBody({ id: "pctpkg2", description: "100x guaranteed" }),
     );
   });
 
@@ -1096,7 +1256,7 @@ describe("warp-registry search LIKE escaping", () => {
 
   test("underscore in q is matched literally, not as a single-character wildcard", async () => {
     const res = await fetch(
-      `${base}/v1/search?q=${encodeURIComponent("foo_bar")}`,
+      `${base}/v2/search?query=${encodeURIComponent("foo_bar")}`,
     );
     assert.equal(res.status, 200);
     const body = await res.json();
@@ -1108,7 +1268,7 @@ describe("warp-registry search LIKE escaping", () => {
 
   test("percent in q is matched literally, not as a wildcard", async () => {
     const res = await fetch(
-      `${base}/v1/search?q=${encodeURIComponent("100%guaranteed")}`,
+      `${base}/v2/search?query=${encodeURIComponent("100%guaranteed")}`,
     );
     assert.equal(res.status, 200);
     const body = await res.json();
@@ -1119,7 +1279,7 @@ describe("warp-registry search LIKE escaping", () => {
   });
 });
 
-describe("warp-registry packages pagination", () => {
+describe("warp-registry v2 packages pagination", () => {
   let server;
   let db;
   let base;
@@ -1130,7 +1290,7 @@ describe("warp-registry packages pagination", () => {
     const setCreatedAt = (owner, id, createdAt) => {
       db.prepare(
         `UPDATE versions SET created_at = ?
-         WHERE owner_id = (SELECT id FROM owners WHERE github_username = ?)
+         WHERE owner_id = (SELECT id FROM users WHERE namespace = ?)
            AND package_id = ?`,
       ).run(createdAt, owner, id);
     };
@@ -1139,7 +1299,7 @@ describe("warp-registry packages pagination", () => {
     await publishRaw(
       base,
       tokenA,
-      buildCustomBody({ id: "aaa", name: "Package A", version: "1.0.0" }),
+      buildPublishBody({ id: "aaa", name: "Package A", version: "1.0.0" }),
     );
     setCreatedAt("paga", "aaa", "2024-01-01 10:00:00");
 
@@ -1147,7 +1307,7 @@ describe("warp-registry packages pagination", () => {
     await publishRaw(
       base,
       tokenB,
-      buildCustomBody({ id: "bbb", name: "Package B", version: "1.0.0" }),
+      buildPublishBody({ id: "bbb", name: "Package B", version: "1.0.0" }),
     );
     setCreatedAt("pagb", "bbb", "2024-01-02 10:00:00");
 
@@ -1155,7 +1315,7 @@ describe("warp-registry packages pagination", () => {
     await publishRaw(
       base,
       tokenC,
-      buildCustomBody({ id: "ccc", name: "Package C", version: "1.0.0" }),
+      buildPublishBody({ id: "ccc", name: "Package C", version: "1.0.0" }),
     );
     setCreatedAt("pagc", "ccc", "2024-01-03 10:00:00");
   });
@@ -1166,7 +1326,7 @@ describe("warp-registry packages pagination", () => {
   });
 
   test("returns results in recency order and paginates with nextCursor", async () => {
-    const page1Res = await fetch(`${base}/v1/packages?limit=2`);
+    const page1Res = await fetch(`${base}/v2/packages?limit=2`);
     assert.equal(page1Res.status, 200);
     const page1 = await page1Res.json();
     assert.deepEqual(
@@ -1176,7 +1336,7 @@ describe("warp-registry packages pagination", () => {
     assert.ok(page1.nextCursor, "first page must have a nextCursor");
 
     const page2Res = await fetch(
-      `${base}/v1/packages?limit=2&cursor=${encodeURIComponent(page1.nextCursor)}`,
+      `${base}/v2/packages?limit=2&cursor=${encodeURIComponent(page1.nextCursor)}`,
     );
     assert.equal(page2Res.status, 200);
     const page2 = await page2Res.json();
@@ -1188,7 +1348,7 @@ describe("warp-registry packages pagination", () => {
   });
 
   test("response shape includes owner, id, name, description, latestVersion, publishedAt", async () => {
-    const res = await fetch(`${base}/v1/packages?limit=1`);
+    const res = await fetch(`${base}/v2/packages?limit=1`);
     const body = await res.json();
     const pkg = body.packages[0];
     assert.deepEqual(Object.keys(pkg).sort(), [
@@ -1202,11 +1362,11 @@ describe("warp-registry packages pagination", () => {
     assert.equal(pkg.id, "ccc");
     assert.equal(pkg.name, "Package C");
     assert.equal(pkg.latestVersion, "1.0.0");
-    assert.equal(pkg.publishedAt, "2024-01-03 10:00:00");
+    assert.equal(pkg.publishedAt, "2024-01-03T10:00:00Z");
   });
 });
 
-describe("warp-registry packages pagination: limit and cursor validation", () => {
+describe("warp-registry v2 packages pagination: limit and cursor validation", () => {
   let server;
   let db;
   let base;
@@ -1217,7 +1377,11 @@ describe("warp-registry packages pagination: limit and cursor validation", () =>
     const token = insertApprovedOwner(db, "bulkowner");
     for (let i = 0; i < 55; i++) {
       const id = `bulk${String(i).padStart(2, "0")}`;
-      await publishRaw(base, token, buildCustomBody({ id, name: `Bulk ${i}` }));
+      await publishRaw(
+        base,
+        token,
+        buildPublishBody({ id, name: `Bulk ${i}` }),
+      );
     }
   });
 
@@ -1227,7 +1391,7 @@ describe("warp-registry packages pagination: limit and cursor validation", () =>
   });
 
   test("limit above 50 is clamped to 50", async () => {
-    const res = await fetch(`${base}/v1/packages?limit=100`);
+    const res = await fetch(`${base}/v2/packages?limit=100`);
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.packages.length, 50);
@@ -1235,31 +1399,31 @@ describe("warp-registry packages pagination: limit and cursor validation", () =>
   });
 
   test("non-positive or non-integer limit returns 400", async () => {
-    const zero = await fetch(`${base}/v1/packages?limit=0`);
+    const zero = await fetch(`${base}/v2/packages?limit=0`);
     assert.equal(zero.status, 400);
 
-    const negative = await fetch(`${base}/v1/packages?limit=-5`);
+    const negative = await fetch(`${base}/v2/packages?limit=-5`);
     assert.equal(negative.status, 400);
 
-    const nonInteger = await fetch(`${base}/v1/packages?limit=2.5`);
+    const nonInteger = await fetch(`${base}/v2/packages?limit=2.5`);
     assert.equal(nonInteger.status, 400);
 
-    const notANumber = await fetch(`${base}/v1/packages?limit=abc`);
+    const notANumber = await fetch(`${base}/v2/packages?limit=abc`);
     assert.equal(notANumber.status, 400);
   });
 
   test("invalid cursor returns 400", async () => {
-    const notBase64 = await fetch(`${base}/v1/packages?cursor=not-a-cursor`);
+    const notBase64 = await fetch(`${base}/v2/packages?cursor=not-a-cursor`);
     assert.equal(notBase64.status, 400);
 
     const badJson = await fetch(
-      `${base}/v1/packages?cursor=${encodeURIComponent(Buffer.from("not json").toString("base64"))}`,
+      `${base}/v2/packages?cursor=${encodeURIComponent(Buffer.from("not json").toString("base64"))}`,
     );
     assert.equal(badJson.status, 400);
   });
 });
 
-describe("warp-registry stats endpoint", () => {
+describe("warp-registry v2 stats endpoint", () => {
   let server;
   let db;
   let base;
@@ -1271,26 +1435,26 @@ describe("warp-registry stats endpoint", () => {
     await publishRaw(
       base,
       token1,
-      buildCustomBody({ id: "statpkg", version: "0.1.0" }),
+      buildPublishBody({ id: "statpkg", version: "0.1.0" }),
     );
     await publishRaw(
       base,
       token1,
-      buildCustomBody({ id: "statpkg", version: "0.2.0" }),
+      buildPublishBody({ id: "statpkg", version: "0.2.0" }),
     );
 
     const token2 = insertApprovedOwner(db, "statowner2");
     await publishRaw(
       base,
       token2,
-      buildCustomBody({ id: "otherpkg", version: "1.0.0" }),
+      buildPublishBody({ id: "otherpkg", version: "1.0.0" }),
     );
 
     const pendingToken = insertOwner(db, "statpendingowner");
     await publishRaw(
       base,
       pendingToken,
-      buildCustomBody({ id: "pendingpkg", version: "0.1.0" }),
+      buildPublishBody({ id: "pendingpkg", version: "0.1.0" }),
     );
   });
 
@@ -1300,7 +1464,7 @@ describe("warp-registry stats endpoint", () => {
   });
 
   test("stats reflect published pairs, pending rows, and distinct authors", async () => {
-    const res = await fetch(`${base}/v1/stats`);
+    const res = await fetch(`${base}/v2/stats`);
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.published, 2);
@@ -1309,7 +1473,7 @@ describe("warp-registry stats endpoint", () => {
   });
 });
 
-describe("warp-registry second pending publish guard", () => {
+describe("warp-registry v2 second pending publish guard", () => {
   let server;
   let dataDir;
   let db;
@@ -1330,15 +1494,15 @@ describe("warp-registry second pending publish guard", () => {
     const aRes = await publishRaw(
       base,
       token,
-      buildCustomBody({ id: "pkga", version: "0.1.0" }),
+      buildPublishBody({ id: "pkga", version: "0.1.0" }),
     );
     assert.equal(aRes.status, 201);
-    assert.equal((await aRes.json()).status, "pending");
+    assert.equal((await aRes.json()).extension.approved, false);
 
     const bRes = await publishRaw(
       base,
       token,
-      buildCustomBody({ id: "pkgb", version: "0.1.0" }),
+      buildPublishBody({ id: "pkgb", version: "0.1.0" }),
     );
     assert.equal(bRes.status, 409);
     const bBody = await bRes.json();
@@ -1346,8 +1510,8 @@ describe("warp-registry second pending publish guard", () => {
 
     const bRows = db
       .prepare(
-        `SELECT v.* FROM versions v JOIN owners o ON o.id = v.owner_id
-         WHERE o.github_username = 'pendingguard' AND v.package_id = 'pkgb'`,
+        `SELECT v.* FROM versions v JOIN users u ON u.id = v.owner_id
+         WHERE u.namespace = 'pendingguard' AND v.package_id = 'pkgb'`,
       )
       .all();
     assert.equal(
@@ -1366,32 +1530,279 @@ describe("warp-registry second pending publish guard", () => {
     const bRetry = await publishRaw(
       base,
       token,
-      buildCustomBody({ id: "pkgb", version: "0.1.0" }),
+      buildPublishBody({ id: "pkgb", version: "0.1.0" }),
     );
     assert.equal(bRetry.status, 201);
     const bRetryBody = await bRetry.json();
-    assert.equal(bRetryBody.status, "published");
+    assert.equal(bRetryBody.extension.approved, true);
   });
 });
 
-/**
- * Publishes a modified version of the helloworld fixture with a custom version.
- * @param {string} base - The base URL of the test server.
- * @param {string} token - The authentication token.
- * @param {string} version - The version string to use.
- * @returns {Promise<Response>} The fetch response.
- */
-async function publishForVersion(base, token, version) {
-  const body = fs
-    .readFileSync(path.join(fixturesDir, "helloworld@0.1.0.js"))
-    .toString()
-    .replace('version: "0.1.0"', `version: "${version}"`);
-  return fetch(`${base}/v1/publish`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/javascript",
-      Authorization: `Bearer ${token}`,
-    },
-    body,
+describe("warp-registry v2 users endpoint", () => {
+  let server;
+  let db;
+  let base;
+
+  before(async () => {
+    ({ server, db, base } = await startServer());
   });
-}
+
+  after(async () => {
+    await closeServer(server);
+    db.close();
+  });
+
+  test("GET /v2/users returns paginated user list", async () => {
+    insertOwner(db, "user1");
+    insertOwner(db, "user2");
+    const res = await fetch(`${base}/v2/users`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.ok(Array.isArray(body.users));
+    assert.ok(body.users.length >= 2);
+    assert.ok(body.users[0].namespace);
+  });
+
+  test("GET /v2/users/:namespace returns a single user", async () => {
+    insertOwner(db, "singleuser");
+    const res = await fetch(`${base}/v2/users/singleuser`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.namespace, "singleuser");
+    assert.ok(Array.isArray(body.extensions));
+  });
+
+  test("GET /v2/users/:namespace returns 404 for unknown user", async () => {
+    const res = await fetch(`${base}/v2/users/nonexistent`);
+    assert.equal(res.status, 404);
+  });
+});
+
+describe("warp-registry v2 user update and delete", () => {
+  let server;
+  let db;
+  let base;
+
+  before(async () => {
+    ({ server, db, base } = await startServer());
+  });
+
+  after(async () => {
+    await closeServer(server);
+    db.close();
+  });
+
+  test("user can update own displayName", async () => {
+    const { token } = await signup(
+      base,
+      "updateuser",
+      "password123",
+      "Old Name",
+    );
+    const res = await fetch(`${base}/v2/users/updateuser`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ displayName: "New Name" }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.displayName, "New Name");
+  });
+
+  test("user cannot update another user", async () => {
+    const { token } = await signup(base, "usera", "password123");
+    insertOwner(db, "userb");
+    const res = await fetch(`${base}/v2/users/userb`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ displayName: "Hacked" }),
+    });
+    assert.equal(res.status, 403);
+  });
+
+  test("admin can update any user", async () => {
+    const adminToken = insertAdmin(db, "adminuser");
+    insertOwner(db, "targetuser");
+    const res = await fetch(`${base}/v2/users/targetuser`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${adminToken}`,
+      },
+      body: JSON.stringify({ displayName: "Admin Updated" }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.displayName, "Admin Updated");
+  });
+
+  test("user can delete own account", async () => {
+    const { token } = await signup(base, "selfdelete", "password123");
+    const res = await fetch(`${base}/v2/users/selfdelete`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(res.status, 200);
+    const check = await fetch(`${base}/v2/users/selfdelete`);
+    assert.equal(check.status, 404);
+  });
+
+  test("unauthenticated PATCH returns 401", async () => {
+    const res = await fetch(`${base}/v2/users/anyone`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ displayName: "X" }),
+    });
+    assert.equal(res.status, 401);
+  });
+});
+
+describe("warp-registry v2 extension update and delete", () => {
+  let server;
+  let db;
+  let base;
+
+  before(async () => {
+    ({ server, db, base } = await startServer());
+  });
+
+  after(async () => {
+    await closeServer(server);
+    db.close();
+  });
+
+  test("owner can update own extension meta", async () => {
+    const token = insertApprovedOwner(db, "extowner");
+    await publishRaw(base, token, buildPublishBody({ id: "myext" }));
+
+    const res = await fetch(`${base}/v2/@extowner/myext`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        meta: {
+          class: "MyExt",
+          name: "Updated Name",
+          id: "myext",
+          license: "MIT",
+          authors: ["test"],
+          description: "updated",
+          version: "0.1.0",
+        },
+      }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.meta.name, "Updated Name");
+  });
+
+  test("non-owner cannot update extension", async () => {
+    const ownerToken = insertApprovedOwner(db, "extowner2");
+    await publishRaw(base, ownerToken, buildPublishBody({ id: "secureext" }));
+
+    const otherToken = insertApprovedOwner(db, "otherperson");
+    const res = await fetch(`${base}/v2/@extowner2/secureext`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${otherToken}`,
+      },
+      body: JSON.stringify({
+        meta: {
+          class: "X",
+          name: "Hijacked",
+          id: "secureext",
+          license: "MIT",
+          authors: [],
+          description: "x",
+          version: "0.1.0",
+        },
+      }),
+    });
+    assert.equal(res.status, 403);
+  });
+
+  test("owner can delete own extension", async () => {
+    const token = insertApprovedOwner(db, "delowner");
+    await publishRaw(base, token, buildPublishBody({ id: "delme" }));
+
+    const res = await fetch(`${base}/v2/@delowner/delme`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(res.status, 200);
+
+    const check = await fetch(`${base}/v2/@delowner/delme`);
+    assert.equal(check.status, 404);
+  });
+});
+
+describe("warp-registry v2 approve endpoint", () => {
+  let server;
+  let db;
+  let base;
+
+  before(async () => {
+    ({ server, db, base } = await startServer());
+  });
+
+  after(async () => {
+    await closeServer(server);
+    db.close();
+  });
+
+  test("admin can approve a pending extension", async () => {
+    const adminToken = insertAdmin(db, "adminapprove");
+    const userToken = insertOwner(db, "normaluser");
+
+    await publishRaw(
+      base,
+      userToken,
+      buildPublishBody({ id: "pendext", version: "0.1.0" }),
+    );
+
+    const res = await fetch(`${base}/v2/@normaluser/pendext/approve`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    assert.equal(res.status, 200);
+
+    const infoRes = await fetch(`${base}/v2/@normaluser/pendext`);
+    assert.equal(infoRes.status, 200);
+    const info = await infoRes.json();
+    assert.deepEqual(info.versions, ["0.1.0"]);
+  });
+
+  test("non-admin cannot approve", async () => {
+    const userToken = insertOwner(db, "nonadmin");
+    const normalToken = insertApprovedOwner(db, "normalapprove");
+    await publishRaw(
+      base,
+      normalToken,
+      buildPublishBody({ id: "unapproved", version: "0.1.0" }),
+    );
+
+    const res = await fetch(`${base}/v2/@normalapprove/unapproved/approve`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${userToken}` },
+    });
+    assert.equal(res.status, 403);
+  });
+
+  test("approve returns 404 for non-existent extension", async () => {
+    const adminToken = insertAdmin(db, "adminnoexist");
+    const res = await fetch(`${base}/v2/@nobody/noext/approve`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    assert.equal(res.status, 404);
+  });
+});

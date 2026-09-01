@@ -4,7 +4,7 @@ A walkthrough for running Warp Registry yourself for the first time.
 
 ## 1. Prerequisites
 
-- **Node.js.** `package.json` declares an `engines` field of `^20.19.0 || ^22.13.0 || >=24`. This project was built and tested against **Node.js v24.14.0** (npm 11.9.0). It relies on built-in `fetch` and the `node --test` runner.
+- **Node.js.** `package.json` declares an `engines` field of `^22.13.0 || >=24`. This project was built and tested against **Node.js v24**. It relies on built-in `fetch` and the `node --test` runner.
 
 ## 2. Install
 
@@ -22,28 +22,17 @@ Create your environment file from the template:
 cp .env.example .env
 ```
 
-## 3. Create a GitHub OAuth App
+## 3. Configure
 
-Warp Registry uses GitHub OAuth to hand out publish tokens, so you need an OAuth App.
-
-1. Go to <https://github.com/settings/developers>.
-2. Click **New OAuth App**.
-3. Fill in an **Application name** and **Homepage URL**.
-4. Set the **Authorization callback URL** to `http://<host>:<port>/callback` for strictly local development, where `<host>:<port>` matches where the server will actually run — and critically, **it must match the `PORT` value in your `.env`**. For example, with `PORT=3000` on your own machine, the callback URL is `http://localhost:3000/callback`. Use HTTP only for `localhost` or other strictly local development. Whenever the server is shared, remotely reachable, or publicly deployed, use an **HTTPS** callback URL (for example `https://registry.example.com/callback`). If these don't match, the `/login` flow will fail.
-5. Click **Register application**.
-6. GitHub now shows a **Client ID** and a **Client Secret**.
-
-Put those values in `.env`:
+The registry requires no external services. Configure the environment file:
 
 ```bash
 PORT=3000
-GITHUB_CLIENT_ID=your_client_id
-GITHUB_CLIENT_SECRET=your_client_secret
-PUBLIC_BASE_URL=https://registry.example.com
+PUBLIC_BASE_URL=
 DATA_DIR=./data
 ```
 
-`PUBLIC_BASE_URL` is optional. When running behind a reverse proxy or a publicly deployed server, set it to the canonical base URL of your deployment (scheme and host, no trailing `/`) — for example `https://registry.example.com`. The registry then builds the OAuth redirect to `${PUBLIC_BASE_URL}/callback` instead of deriving it from the incoming request, so the value must match the **Authorization callback URL** you registered with GitHub above. For plain `http://localhost` development you can leave it empty and the redirect is derived automatically.
+`PUBLIC_BASE_URL` is optional. When running behind a reverse proxy or a publicly deployed server, set it to the canonical base URL of your deployment (scheme and host, no trailing `/`) — for example `https://registry.example.com`.
 
 ## 4. Start the server
 
@@ -59,11 +48,40 @@ A successful startup looks like a green check-marked line:
 
 The `PORT` you see here comes from your `.env`.
 
-## 5. Get a token
+## 5. Create an account
 
-Open `http://localhost:3000/login` in a browser and complete the GitHub OAuth flow. The callback page shows your access token in a `<pre>` block.
+Sign up with a username (`namespace`), an optional display name, and a password of at least 8 characters:
 
-**This token is displayed exactly once and can never be retrieved again.** Save it somewhere safe before navigating away. You'll use it as the `Authorization: Bearer <token>` header when publishing.
+```bash
+curl -X POST http://localhost:3000/v2/auth/signup \
+  -H "Content-Type: application/json" \
+  -d '{"namespace":"yourname","displayName":"Your Name","password":"a-strong-password"}'
+```
+
+A successful signup returns `201` with your user object and an opaque bearer token:
+
+```json
+{
+  "user": {
+    "id": 1,
+    "displayName": "Your Name",
+    "namespace": "yourname",
+    "type": "normal",
+    "extensions": []
+  },
+  "token": "e4f2...hex-token..."
+}
+```
+
+**The token is your credential.** Store it somewhere safe. You'll use it as the `Authorization: Bearer <token>` header for all authenticated requests. If you lose it, log in again to get a fresh one:
+
+```bash
+curl -X POST http://localhost:3000/v2/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"namespace":"yourname","password":"a-strong-password"}'
+```
+
+Passwords are salted and hashed with scrypt on the server, and only the hash is stored.
 
 ## 6. Publish something
 
@@ -78,59 +96,112 @@ npx warp-compiler init
 npx warp-compiler build
 ```
 
-That produces a freshly compiled `dist/helloworld@0.1.0.js`. (The `init`/`build` commands print a few warnings about package.json fields not matching the manifest — those are expected and don't affect the output.) Use that real build to publish:
+That produces a freshly compiled `dist/helloworld@0.1.0.js`. (The `init`/`build` commands print a few warnings about package.json fields not matching the manifest — those are expected and don't affect the output.) Use that real build to publish via the JSON API:
 
 ```bash
-curl -X POST http://localhost:3000/v1/publish \
-  -H "Content-Type: application/javascript" \
+curl -X POST http://localhost:3000/v2/publish \
+  -H "Content-Type: application/json" \
   -H "Authorization: Bearer <your-token>" \
-  --data-binary @dist/helloworld@0.1.0.js
+  -d '{
+    "id": "helloworld",
+    "meta": {
+      "class": "HelloWorld",
+      "name": "It works!",
+      "id": "helloworld",
+      "license": "Apache-2.0",
+      "authors": ["You"],
+      "description": "A description of the extension.",
+      "version": "0.1.0"
+    },
+    "extensionBlob": "<contents of dist/helloworld@0.1.0.js>"
+  }'
 ```
 
-A successful publish returns `201` with JSON describing the version:
+A successful publish returns `201` with JSON describing the extension:
 
 ```json
 {
-  "owner": "your-gh-username",
-  "id": "helloworld",
-  "version": "0.1.0",
-  "status": "pending",
-  "url": "/v1/your-gh-username/helloworld/0.1.0"
+  "extension": {
+    "owner": "yourname",
+    "id": "helloworld",
+    "meta": { "class": "HelloWorld", "name": "It works!" },
+    "versions": [],
+    "approved": false
+  },
+  "publishedUrl": "/v2/@yourname/helloworld"
 }
 ```
+
+> Tip: rather than pasting large files inline, generate the JSON body programmatically, e.g. with `json -e 'this.extensionBlob = require("node:fs").readFileSync("dist/helloworld@0.1.0.js", "utf8")'` or a small Node/JQ script.
 
 ## 7. Approve the first publish
 
 A brand-new owner's **first** publish is held as `pending`. Pending versions are stored on disk and in the database but are not served over HTTP until approved — you'll get `404` from the info and blob endpoints until then.
 
-Approve it with the CLI script, passing `github_username`, `package_id`, and `version`:
+An **admin** can approve it through the API:
 
 ```bash
-node scripts/approve.js your-gh-username helloworld 0.1.0
+curl -X POST http://localhost:3000/v2/@yourname/helloworld/approve \
+  -H "Authorization: Bearer <admin-token>"
 ```
 
-You should see a green `✓ Approved your-gh-username/helloworld@0.1.0 (owner now has_published=1)`.
+Or with the CLI script (works directly against the database, no token required), passing `namespace`, `package_id`, and `version`:
+
+```bash
+node scripts/approve.js yourname helloworld 0.1.0
+```
+
+You should see a green `✓ Approved yourname/helloworld@0.1.0 (owner now has_published=1)`.
 
 After that first approval, **every publish from the same owner is `published` immediately** and needs no further approval.
 
-If your GitHub username contains characters you don't want to type, note that `data/registry.db` (set via `DATA_DIR`) stores the owner by username; the approve script looks owners up by that exact string.
+To make a given account an admin, update its row in the database:
+
+```bash
+sqlite3 data/registry.db "UPDATE users SET type='admin' WHERE namespace='yourname';"
+```
 
 ## 8. Confirm it's live
 
 Fetch the package info — it lists all published versions and the latest one:
 
 ```bash
-curl http://localhost:3000/v1/your-gh-username/helloworld
+curl http://localhost:3000/v2/@yourname/helloworld
 ```
 
 Fetch a specific version's compiled source:
 
 ```bash
-curl http://localhost:3000/v1/your-gh-username/helloworld/0.1.0
+curl http://localhost:3000/v2/@yourname/helloworld/0.1.0
 ```
 
-The latter serves the same `application/javascript` blob you uploaded. (`/v1/your-gh-username/helloworld/latest` works too.)
+The latter serves the same `application/javascript` blob you uploaded. (`/v2/@yourname/helloworld/latest` works too.)
 
 ## 9. Load it into TurboWarp
 
-Now you can load the example extension you published into TurboWarp. You can load it from the URL: `http://localhost:3000/v1/your-gh-username/helloworld/0.1.0`.
+Now you can load the example extension you published into TurboWarp. You can load it from the URL: `http://localhost:3000/v2/@yourname/helloworld/0.1.0`.
+
+## 10. Manage your account
+
+Update your display name or password:
+
+```bash
+curl -X PATCH http://localhost:3000/v2/users/yourname \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <your-token>" \
+  -d '{"displayName":"New Name"}'
+```
+
+Log out (revokes the current token):
+
+```bash
+curl -X POST http://localhost:3000/v2/auth/logout \
+  -H "Authorization: Bearer <your-token>"
+```
+
+Delete your account (revokes all tokens and removes your published extensions):
+
+```bash
+curl -X DELETE http://localhost:3000/v2/users/yourname \
+  -H "Authorization: Bearer <your-token>"
+```

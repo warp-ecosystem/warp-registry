@@ -24,8 +24,6 @@ function resolveShutdownTimeout() {
 const SHUTDOWN_TIMEOUT = resolveShutdownTimeout();
 
 const config = {
-  GITHUB_CLIENT_ID: process.env.GITHUB_CLIENT_ID,
-  GITHUB_CLIENT_SECRET: process.env.GITHUB_CLIENT_SECRET,
   PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL,
 };
 
