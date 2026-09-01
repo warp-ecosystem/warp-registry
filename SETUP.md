@@ -141,8 +141,10 @@ A brand-new owner's **first** publish is held as `pending`. Pending versions are
 An **admin** can approve it through the API, but the approving account must have admin privileges. To bootstrap the first admin, promote a user's row in the database. The database lives under the `DATA_DIR` you configured in `.env` (default `./data`):
 
 ```bash
-sqlite3 $DATA_DIR/registry.db "UPDATE users SET type='admin' WHERE namespace='yourname';"
+sqlite3 "${DATA_DIR:-./data}/registry.db" "UPDATE users SET type='admin' WHERE namespace='yourname';"
 ```
+
+If your registry uses a non-default `DATA_DIR`, you must `export DATA_DIR=/path/to/dir` (or `source .env`) in your shell before running that command — `sqlite3` does not read `.env`, and without it the command falls back to `./data`.
 
 Then approve through the API:
 

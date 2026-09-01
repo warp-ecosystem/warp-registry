@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import express from "express";
 import semver from "semver";
-import { blobPath, blobsDir } from "./db.js";
+import { NAMESPACE_RE, blobPath, blobsDir } from "./db.js";
 import { extractWarpMeta } from "./warp-meta.js";
 import { success, error } from "./logger.js";
 
@@ -12,12 +12,6 @@ import { success, error } from "./logger.js";
  * Package IDs must start with an alphanumeric character and can contain dots, dashes, and underscores.
  */
 export const PACKAGE_ID_RE = /^[a-z0-9](?:[a-z0-9._-]{0,63})$/;
-
-/**
- * Regular expression for validating user namespaces.
- * Namespaces must start with a lowercase alphanumeric character and can contain hyphens.
- */
-export const NAMESPACE_RE = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
 
 /**
  * Computes the SHA-256 hash of a token.
@@ -430,7 +424,7 @@ export function createApp({ db, dataDir }) {
       return;
     }
 
-    const rateKey = `signup:${namespace}|${clientIp(req)}`;
+    const rateKey = `signup:${clientIp(req)}`;
     if (rateLimiter.onFailure(rateKey)) {
       rateLimited(res);
       return;
@@ -446,12 +440,23 @@ export function createApp({ db, dataDir }) {
 
     const passwordHash = await hashPassword(password);
 
-    const result = db
-      .prepare(
-        `INSERT INTO users (namespace, display_name, password_hash, type)
-         VALUES (?, ?, ?, 'normal')`,
-      )
-      .run(namespace, displayName || "", passwordHash);
+    let result;
+    try {
+      result = db
+        .prepare(
+          `INSERT INTO users (namespace, display_name, password_hash, type)
+           VALUES (?, ?, ?, 'normal')`,
+        )
+        .run(namespace, displayName || "", passwordHash);
+    } catch (err) {
+      if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
+        res.status(409).json({ error: "Namespace already exists." });
+        return;
+      }
+      throw err;
+    }
+
+    rateLimiter.onSuccess(rateKey);
 
     const user = db
       .prepare("SELECT * FROM users WHERE id = ?")

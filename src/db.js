@@ -56,14 +56,9 @@ CREATE TABLE IF NOT EXISTS versions (
  * account cannot log in with a password and instead requires a one-time recovery:
  *
  *   1. An admin sets a password via the CLI, or the account owner uses
- *      `PATCH /v2/users/:namespace` (requires an admin-issued token) to set one,
- *      or
- *   2. The operator runs the following to force a reset on first login:
- *      `sqlite3 "$DATA_DIR/registry.db" "UPDATE users SET password_hash='' WHERE namespace='<name>';"`
- *      and has the user sign up again / reset via admin tooling.
+ *      `PATCH /v2/users/:namespace` (requires an admin-issued token) to set one.
  *
- * Only the first recovery mechanism is fully built into this release; until a
- * password is set the account cannot authenticate through the normal login flow.
+ * Until a password is set the account cannot authenticate through the normal login flow.
  *
  * @param {import('better-sqlite3').Database} db - The database instance.
  */

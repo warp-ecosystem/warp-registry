@@ -71,13 +71,14 @@ test("v1 owners schema is migrated to v2 users schema", () => {
 
       const users = ndb.prepare("SELECT COUNT(*) AS c FROM users").get().c;
       assert.equal(users, 3, "all migrated rows are preserved");
-      const uniqueNamespaces = new Set(
-        ndb
-          .prepare("SELECT namespace FROM users")
-          .all()
-          .map((r) => r.namespace),
-      ).size;
-      assert.equal(uniqueNamespaces, 3, "name collisions are de-duplicated");
+
+      const collided = ndb.prepare("SELECT * FROM users WHERE id = 3").get();
+      assert.ok(collided, "colliding owner row must be migrated");
+      assert.equal(
+        collided.namespace,
+        "olduser1",
+        "name collisions are de-duplicated with a numeric suffix visible to users",
+      );
 
       const version = ndb
         .prepare("SELECT * FROM versions WHERE package_id = 'oldpkg'")
