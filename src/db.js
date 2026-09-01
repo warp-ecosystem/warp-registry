@@ -3,6 +3,14 @@ import fs from "node:fs";
 import path from "node:path";
 
 /**
+ * Regular expression for validating user namespaces.
+ * Namespaces must start with a lowercase alphanumeric character and can contain hyphens.
+ * Kept here as the single source of truth so migrations classify GitHub usernames
+ * the same way the signup endpoint does.
+ */
+export const NAMESPACE_RE = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
+
+/**
  * SQL schema definition for the database.
  * Creates tables for users, auth tokens, and versions with their constraints.
  */
@@ -11,7 +19,7 @@ CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY,
   namespace TEXT UNIQUE NOT NULL,
   display_name TEXT NOT NULL DEFAULT '',
-  password_hash TEXT NOT NULL,
+  password_hash TEXT NOT NULL DEFAULT '',
   type TEXT NOT NULL CHECK (type IN ('admin', 'normal')) DEFAULT 'normal',
   has_published INTEGER NOT NULL DEFAULT 0
 );
@@ -42,6 +50,21 @@ CREATE TABLE IF NOT EXISTS versions (
  * Migrates the database schema from v1 (owners) to v2 (users).
  * Only runs if the old owners table exists and the new users table does not.
  * Wraps the migration in a transaction for safety.
+ *
+ * Recovered-account note: v1 owners authenticated via GitHub OAuth, so they have
+ * no password. The migration copies them with an empty password_hash. A migrated
+ * account cannot log in with a password and instead requires a one-time recovery:
+ *
+ *   1. An admin sets a password via the CLI, or the account owner uses
+ *      `PATCH /v2/users/:namespace` (requires an admin-issued token) to set one,
+ *      or
+ *   2. The operator runs the following to force a reset on first login:
+ *      `sqlite3 "$DATA_DIR/registry.db" "UPDATE users SET password_hash='' WHERE namespace='<name>';"`
+ *      and has the user sign up again / reset via admin tooling.
+ *
+ * Only the first recovery mechanism is fully built into this release; until a
+ * password is set the account cannot authenticate through the normal login flow.
+ *
  * @param {import('better-sqlite3').Database} db - The database instance.
  */
 function migrateSchema(db) {
@@ -72,10 +95,32 @@ function migrateSchema(db) {
         has_published INTEGER NOT NULL DEFAULT 0
       )`,
     );
-    db.exec(
-      `INSERT INTO users (id, namespace, has_published)
-       SELECT id, github_username, has_published FROM owners`,
+
+    const owners = db
+      .prepare(
+        "SELECT id, github_username, has_published FROM owners ORDER BY id",
+      )
+      .all();
+    const usedNamespaces = new Set();
+    const insertUser = db.prepare(
+      "INSERT INTO users (id, namespace, password_hash, has_published) VALUES (?, ?, '', ?)",
     );
+    for (const owner of owners) {
+      let namespace = String(owner.github_username || "")
+        .trim()
+        .toLowerCase();
+      if (!NAMESPACE_RE.test(namespace)) {
+        namespace = `user${owner.id}`;
+      }
+      let candidate = namespace;
+      let suffix = 0;
+      while (usedNamespaces.has(candidate)) {
+        suffix += 1;
+        candidate = `${namespace}${suffix}`;
+      }
+      usedNamespaces.add(candidate);
+      insertUser.run(owner.id, candidate, owner.has_published);
+    }
 
     db.exec(
       `CREATE TABLE IF NOT EXISTS auth_tokens (

@@ -6,8 +6,9 @@ Warp Registry is a Node (Express) server similar to a container registry that st
 
 ## Features
 
-- **Username/password accounts** — sign up, log in, and manage your own account. Passwords are hashed server-side with scrypt and never stored in plain text.
-- **Bearer token auth** — every publish and account/extension edit is authenticated with an opaque bearer token issued at signup/login. Tokens can be revoked at any time (logout invalidates the current token; deleting your account revokes all of them).
+- **Username/password accounts** — sign up, log in, and manage your own account. Passwords are hashed server-side with scrypt (asynchronously) and never stored in plain text.
+- **Bearer token auth** — every publish and account/extension edit is authenticated with an opaque bearer token issued at signup/login. Tokens expire after 7 days and can be revoked at any time (logout invalidates the current token; changing your password or deleting your account revokes all of them).
+- **Brute-force protection** — login and signup are rate-limited per namespace + IP (5 attempts / 15 min) and respond `429` before any password hashing or verification once the limit is hit.
 - **First-publish moderation** — a brand-new owner's first publish is held as `pending` until an admin approves it, to keep the registry tamper-resistant.
 - **Admin moderation** — admins can approve pending extensions via the API or the CLI approval script.
 - **Semantic versioning** — each package tracks multiple versions per owner, validated against semver rules.

@@ -3,7 +3,7 @@
   "info": {
     "title": "Warp Registry API",
     "description": "RESTful API for interacting with the Warp Registry",
-    "version": "0.2.0"
+    "version": "1.0.0"
   },
   "servers": [
     { "url": "https://warp.sdisk.us/v2", "description": "Production server" },
@@ -322,7 +322,7 @@
         "tags": ["OPEN"],
         "parameters": [
           {
-            "name": "q",
+            "name": "query",
             "in": "query",
             "required": true,
             "schema": { "type": "string" }

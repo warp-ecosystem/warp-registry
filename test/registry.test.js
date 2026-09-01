@@ -61,13 +61,13 @@ async function signup(
  * @param {import('better-sqlite3').Database} db - The database instance.
  * @param {string} namespace - The user namespace.
  * @param {boolean} [hasPublished=false] - Whether the user has published before.
- * @returns {string} The generated token.
+ * @returns {Promise<string>} The generated token.
  */
-function insertOwner(db, namespace, hasPublished = false) {
+async function insertOwner(db, namespace, hasPublished = false) {
   const token = crypto.randomBytes(32).toString("hex");
   db.prepare(
     "INSERT INTO users (namespace, display_name, password_hash, type, has_published) VALUES (?, '', ?, 'normal', ?)",
-  ).run(namespace, hashPassword("testpassword123"), hasPublished ? 1 : 0);
+  ).run(namespace, await hashPassword("testpassword123"), hasPublished ? 1 : 0);
   db.prepare("INSERT INTO auth_tokens (user_id, token_hash) VALUES (?, ?)").run(
     db.prepare("SELECT id FROM users WHERE namespace = ?").get(namespace).id,
     hashToken(token),
@@ -79,7 +79,7 @@ function insertOwner(db, namespace, hasPublished = false) {
  * Inserts a brand approved owner (has_published=1) and returns a token.
  * @param {import('better-sqlite3').Database} db - The database instance.
  * @param {string} namespace - The user namespace.
- * @returns {string} The generated token.
+ * @returns {Promise<string>} The generated token.
  */
 function insertApprovedOwner(db, namespace) {
   return insertOwner(db, namespace, true);
@@ -89,13 +89,13 @@ function insertApprovedOwner(db, namespace) {
  * Inserts an admin user directly into the database and returns a token.
  * @param {import('better-sqlite3').Database} db - The database instance.
  * @param {string} namespace - The admin namespace.
- * @returns {string} The generated token.
+ * @returns {Promise<string>} The generated token.
  */
-function insertAdmin(db, namespace) {
+async function insertAdmin(db, namespace) {
   const token = crypto.randomBytes(32).toString("hex");
   db.prepare(
     "INSERT INTO users (namespace, display_name, password_hash, type, has_published) VALUES (?, '', ?, 'admin', 1)",
-  ).run(namespace, hashPassword("testpassword123"));
+  ).run(namespace, await hashPassword("testpassword123"));
   db.prepare("INSERT INTO auth_tokens (user_id, token_hash) VALUES (?, ?)").run(
     db.prepare("SELECT id FROM users WHERE namespace = ?").get(namespace).id,
     hashToken(token),
@@ -142,24 +142,6 @@ function buildPublishBody(overrides = {}) {
  * @returns {Promise<Response>} The fetch response.
  */
 function publish(base, token, body) {
-  return fetch(`${base}/v2/publish`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(body),
-  });
-}
-
-/**
- * Publishes a raw body string to the server.
- * @param {string} base - The base URL of the test server.
- * @param {string} token - The authentication token.
- * @param {object} body - The publish request body.
- * @returns {Promise<Response>} The fetch response.
- */
-function publishRaw(base, token, body) {
   return fetch(`${base}/v2/publish`, {
     method: "POST",
     headers: {
@@ -322,6 +304,112 @@ describe("warp-registry v2 auth flow", () => {
   });
 });
 
+describe("warp-registry v2 auth hardening", () => {
+  let server;
+  let db;
+  let base;
+
+  before(async () => {
+    ({ server, db, base } = await startServer());
+  });
+
+  after(async () => {
+    await closeServer(server);
+    db.close();
+  });
+
+  const login = (namespace, password) =>
+    fetch(`${base}/v2/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ namespace, password }),
+    });
+
+  test("login is throttled with 429 after repeated failures", async () => {
+    await signup(base, "ratelimituser", "correct-password-1");
+
+    let status;
+    for (let i = 1; i <= 4; i += 1) {
+      status = (await login("ratelimituser", "wrong-password")).status;
+      assert.equal(status, 401);
+    }
+    assert.equal((await login("ratelimituser", "wrong-password")).status, 429);
+    assert.equal(
+      (await login("ratelimituser", "correct-password-1")).status,
+      429,
+      "a correct password is still rejected while throttled",
+    );
+  });
+
+  test("signup is throttled with 429 after repeated attempts", async () => {
+    const attempt = () =>
+      fetch(`${base}/v2/auth/signup`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          namespace: "ratelimitsignup",
+          password: "password1234",
+        }),
+      });
+
+    assert.equal((await attempt()).status, 201);
+    assert.equal((await attempt()).status, 409);
+    assert.equal((await attempt()).status, 409);
+    assert.equal((await attempt()).status, 409);
+    assert.equal((await attempt()).status, 429);
+  });
+
+  test("expired tokens are rejected with 401", async () => {
+    const { token } = await signup(base, "expireduser");
+    db.prepare(
+      `UPDATE auth_tokens SET expires_at = '2000-01-01T00:00:00.000Z'
+       WHERE user_id = (SELECT id FROM users WHERE namespace = 'expireduser')`,
+    ).run();
+
+    const res = await fetch(`${base}/v2/auth/logout`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(res.status, 401);
+
+    const remaining = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM auth_tokens
+         WHERE user_id = (SELECT id FROM users WHERE namespace = 'expireduser')`,
+      )
+      .get().c;
+    assert.equal(remaining, 0, "expired token rows are cleaned up");
+  });
+
+  test("password change revokes all existing tokens", async () => {
+    const { token } = await signup(base, "pwdchanger", "old-password-1");
+    const patch = await fetch(`${base}/v2/users/pwdchanger`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ password: "new-password-1" }),
+    });
+    assert.equal(patch.status, 200);
+
+    const revoked = await fetch(`${base}/v2/auth/logout`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(
+      revoked.status,
+      401,
+      "the old token must no longer authenticate after a password change",
+    );
+
+    const loginRes = await login("pwdchanger", "new-password-1");
+    assert.equal(loginRes.status, 200);
+    const body = await loginRes.json();
+    assert.ok(body.token);
+  });
+});
+
 describe("warp-registry v2 publish flow", () => {
   let server;
   let dataDir;
@@ -339,7 +427,7 @@ describe("warp-registry v2 publish flow", () => {
   });
 
   test("publishing for a brand-new owner results in status pending and 404 on info", async () => {
-    const token = insertOwner(db, "pendingowner");
+    const token = await insertOwner(db, "pendingowner");
     pendingOwnerToken = token;
     const res = await publish(base, token, buildPublishBody());
     assert.equal(res.status, 201);
@@ -392,7 +480,7 @@ describe("warp-registry v2 publish flow", () => {
   });
 
   test("publishing same (owner, id, version) twice returns 409", async () => {
-    const token = insertOwner(db, "dupowner");
+    const token = await insertOwner(db, "dupowner");
     const first = await publish(base, token, buildPublishBody());
     assert.equal(first.status, 201);
 
@@ -401,7 +489,7 @@ describe("warp-registry v2 publish flow", () => {
   });
 
   test("concurrent publishes for the same version yield one 201 and one 409", async () => {
-    const token = insertOwner(db, "concurrentowner");
+    const token = await insertOwner(db, "concurrentowner");
     const body = buildPublishBody();
 
     const [a, b] = await Promise.all([
@@ -434,7 +522,7 @@ describe("warp-registry v2 publish flow", () => {
   });
 
   test("concurrent same version publish is reported as a duplicate-version conflict, not an owner-level conflict", async () => {
-    const token = insertOwner(db, "concurrentdupver");
+    const token = await insertOwner(db, "concurrentdupver");
     const bodyData = buildPublishBody();
     const encoder = new TextEncoder();
 
@@ -477,7 +565,7 @@ describe("warp-registry v2 publish flow", () => {
   });
 
   test("concurrent publishes for the same unapproved owner with different versions yield one 201 and one 409", async () => {
-    const token = insertOwner(db, "concurrentdiffowner");
+    const token = await insertOwner(db, "concurrentdiffowner");
 
     const [a, b] = await Promise.all([
       publishForVersion(base, token, "0.1.0"),
@@ -503,7 +591,7 @@ describe("warp-registry v2 publish flow", () => {
   });
 
   test("malformed meta returns 400 and never executes the file", async () => {
-    const token = insertOwner(db, "malowner");
+    const token = await insertOwner(db, "malowner");
     const source = fs.readFileSync(
       path.join(fixturesDir, "malformed-meta.js"),
       "utf8",
@@ -544,7 +632,7 @@ describe("warp-registry v2 publish flow", () => {
   });
 
   test("semver sorts 10.0.0 after 2.0.0", async () => {
-    const token = insertOwner(db, "semverowner");
+    const token = await insertOwner(db, "semverowner");
     const dataDirFor = dataDir;
 
     const publishVersion = async (version) => {
@@ -584,7 +672,7 @@ describe("warp-registry v2 publish flow", () => {
   });
 
   test("non-semver meta.version is rejected with 400 and never persisted", async () => {
-    const token = insertOwner(db, "badversionowner");
+    const token = await insertOwner(db, "badversionowner");
     const body = buildPublishBody({ id: "badverpkg" });
     body.meta.version = "not-a-version";
     body.extensionBlob = body.extensionBlob.replace(
@@ -605,7 +693,7 @@ describe("warp-registry v2 publish flow", () => {
   });
 
   test("nested Warp declaration inside a function is rejected with 400", async () => {
-    const token = insertOwner(db, "nestedwarpowner");
+    const token = await insertOwner(db, "nestedwarpowner");
     const source = fs.readFileSync(
       path.join(fixturesDir, "nested-warp.js"),
       "utf8",
@@ -640,7 +728,7 @@ describe("warp-registry v2 publish flow", () => {
   });
 
   test("reconcile does not publish an unapproved version when another is approved", async () => {
-    const token = insertOwner(db, "reconcileowner");
+    const token = await insertOwner(db, "reconcileowner");
     const a = await publish(base, token, buildPublishBody());
     assert.equal(a.status, 201);
     const bodyA = await a.json();
@@ -665,7 +753,7 @@ describe("warp-registry v2 publish flow", () => {
   });
 
   test("reconcile finalizes a staging row whose blob became durable", async () => {
-    const token = insertOwner(db, "stagingowner");
+    const token = await insertOwner(db, "stagingowner");
     const res = await publish(base, token, buildPublishBody());
     assert.equal(res.status, 201);
     const body = await res.json();
@@ -688,7 +776,7 @@ describe("warp-registry v2 publish flow", () => {
   });
 
   test("reconcile deletes a staging row whose blob never became durable", async () => {
-    const token = insertOwner(db, "stagingmissingowner");
+    const token = await insertOwner(db, "stagingmissingowner");
     const res = await publish(base, token, buildPublishBody());
     assert.equal(res.status, 201);
 
@@ -708,7 +796,7 @@ describe("warp-registry v2 publish flow", () => {
   });
 
   test("approval does not miss a version during an in-flight staging->pending transition", async () => {
-    const token = insertOwner(db, "transitionowner");
+    const token = await insertOwner(db, "transitionowner");
     const res = await publish(base, token, buildPublishBody());
     assert.equal(res.status, 201);
 
@@ -755,7 +843,7 @@ describe("warp-registry v2 publish flow", () => {
   });
 
   test("publish is published, not left pending, when approval completes before reservation", async () => {
-    const token = insertOwner(db, "raceowner");
+    const token = await insertOwner(db, "raceowner");
     db.prepare(
       `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
        VALUES ((SELECT id FROM users WHERE namespace = 'raceowner'),
@@ -827,8 +915,8 @@ describe("warp-registry v2 search endpoint", () => {
   before(async () => {
     ({ server, db, base } = await startServer());
 
-    const nameToken = insertApprovedOwner(db, "nameowner");
-    await publishRaw(
+    const nameToken = await insertApprovedOwner(db, "nameowner");
+    await publish(
       base,
       nameToken,
       buildPublishBody({
@@ -838,8 +926,8 @@ describe("warp-registry v2 search endpoint", () => {
       }),
     );
 
-    const idToken = insertApprovedOwner(db, "idowner");
-    await publishRaw(
+    const idToken = await insertApprovedOwner(db, "idowner");
+    await publish(
       base,
       idToken,
       buildPublishBody({
@@ -849,15 +937,15 @@ describe("warp-registry v2 search endpoint", () => {
       }),
     );
 
-    const ownerToken = insertApprovedOwner(db, "ownerhunt");
-    await publishRaw(
+    const ownerToken = await insertApprovedOwner(db, "ownerhunt");
+    await publish(
       base,
       ownerToken,
       buildPublishBody({ id: "pkgx", name: "Whatever Two" }),
     );
 
-    const descToken = insertApprovedOwner(db, "descowner");
-    await publishRaw(
+    const descToken = await insertApprovedOwner(db, "descowner");
+    await publish(
       base,
       descToken,
       buildPublishBody({
@@ -867,8 +955,8 @@ describe("warp-registry v2 search endpoint", () => {
       }),
     );
 
-    const unicodeToken = insertApprovedOwner(db, "unicodeowner");
-    await publishRaw(
+    const unicodeToken = await insertApprovedOwner(db, "unicodeowner");
+    await publish(
       base,
       unicodeToken,
       buildPublishBody({
@@ -878,20 +966,20 @@ describe("warp-registry v2 search endpoint", () => {
       }),
     );
 
-    const multiverToken = insertApprovedOwner(db, "multiver");
-    await publishRaw(
+    const multiverToken = await insertApprovedOwner(db, "multiver");
+    await publish(
       base,
       multiverToken,
       buildPublishBody({ id: "mypkg", name: "MultiVersion", version: "0.1.0" }),
     );
-    await publishRaw(
+    await publish(
       base,
       multiverToken,
       buildPublishBody({ id: "mypkg", name: "MultiVersion", version: "0.2.0" }),
     );
 
-    const sharpSToken = insertApprovedOwner(db, "sharpssowner");
-    await publishRaw(
+    const sharpSToken = await insertApprovedOwner(db, "sharpssowner");
+    await publish(
       base,
       sharpSToken,
       buildPublishBody({
@@ -901,8 +989,8 @@ describe("warp-registry v2 search endpoint", () => {
       }),
     );
 
-    const longSToken = insertApprovedOwner(db, "longsowner");
-    await publishRaw(
+    const longSToken = await insertApprovedOwner(db, "longsowner");
+    await publish(
       base,
       longSToken,
       buildPublishBody({
@@ -912,8 +1000,8 @@ describe("warp-registry v2 search endpoint", () => {
       }),
     );
 
-    const pendingToken = insertOwner(db, "pendingsearch");
-    await publishRaw(
+    const pendingToken = await insertOwner(db, "pendingsearch");
+    await publish(
       base,
       pendingToken,
       buildPublishBody({
@@ -1068,9 +1156,9 @@ describe("warp-registry v2 search endpoint", () => {
   });
 
   test("discovery picks latestVersion by semantic version, not publication order", async () => {
-    const token = insertApprovedOwner(db, "backportowner");
+    const token = await insertApprovedOwner(db, "backportowner");
     const publishVersion = async (version) => {
-      const res = await publishRaw(
+      const res = await publish(
         base,
         token,
         buildPublishBody({ id: "backportpkg", version }),
@@ -1114,9 +1202,9 @@ describe("warp-registry v2 semver precedence in discovery routes", () => {
       ).run(createdAt, owner, id, version);
     };
 
-    const token = insertApprovedOwner(db, "preowner");
+    const token = await insertApprovedOwner(db, "preowner");
     const publishVersion = async (pkgId, version) => {
-      const res = await publishRaw(
+      const res = await publish(
         base,
         token,
         buildPublishBody({ id: pkgId, name: pkgId, version }),
@@ -1220,29 +1308,29 @@ describe("warp-registry v2 search LIKE escaping", () => {
   before(async () => {
     ({ server, db, base } = await startServer());
 
-    const underscoreToken = insertApprovedOwner(db, "usowner");
-    await publishRaw(
+    const underscoreToken = await insertApprovedOwner(db, "usowner");
+    await publish(
       base,
       underscoreToken,
       buildPublishBody({ id: "foo_bar", name: "Foo Bar" }),
     );
 
-    const wildcardishToken = insertApprovedOwner(db, "usowner2");
-    await publishRaw(
+    const wildcardishToken = await insertApprovedOwner(db, "usowner2");
+    await publish(
       base,
       wildcardishToken,
       buildPublishBody({ id: "fooxbar", name: "Foo X Bar" }),
     );
 
-    const percentToken = insertApprovedOwner(db, "pctowner");
-    await publishRaw(
+    const percentToken = await insertApprovedOwner(db, "pctowner");
+    await publish(
       base,
       percentToken,
       buildPublishBody({ id: "pctpkg1", description: "100%guaranteed" }),
     );
 
-    const wildcardPctToken = insertApprovedOwner(db, "pctowner2");
-    await publishRaw(
+    const wildcardPctToken = await insertApprovedOwner(db, "pctowner2");
+    await publish(
       base,
       wildcardPctToken,
       buildPublishBody({ id: "pctpkg2", description: "100x guaranteed" }),
@@ -1295,24 +1383,24 @@ describe("warp-registry v2 packages pagination", () => {
       ).run(createdAt, owner, id);
     };
 
-    const tokenA = insertApprovedOwner(db, "paga");
-    await publishRaw(
+    const tokenA = await insertApprovedOwner(db, "paga");
+    await publish(
       base,
       tokenA,
       buildPublishBody({ id: "aaa", name: "Package A", version: "1.0.0" }),
     );
     setCreatedAt("paga", "aaa", "2024-01-01 10:00:00");
 
-    const tokenB = insertApprovedOwner(db, "pagb");
-    await publishRaw(
+    const tokenB = await insertApprovedOwner(db, "pagb");
+    await publish(
       base,
       tokenB,
       buildPublishBody({ id: "bbb", name: "Package B", version: "1.0.0" }),
     );
     setCreatedAt("pagb", "bbb", "2024-01-02 10:00:00");
 
-    const tokenC = insertApprovedOwner(db, "pagc");
-    await publishRaw(
+    const tokenC = await insertApprovedOwner(db, "pagc");
+    await publish(
       base,
       tokenC,
       buildPublishBody({ id: "ccc", name: "Package C", version: "1.0.0" }),
@@ -1374,14 +1462,10 @@ describe("warp-registry v2 packages pagination: limit and cursor validation", ()
   before(async () => {
     ({ server, db, base } = await startServer());
 
-    const token = insertApprovedOwner(db, "bulkowner");
+    const token = await insertApprovedOwner(db, "bulkowner");
     for (let i = 0; i < 55; i++) {
       const id = `bulk${String(i).padStart(2, "0")}`;
-      await publishRaw(
-        base,
-        token,
-        buildPublishBody({ id, name: `Bulk ${i}` }),
-      );
+      await publish(base, token, buildPublishBody({ id, name: `Bulk ${i}` }));
     }
   });
 
@@ -1431,27 +1515,27 @@ describe("warp-registry v2 stats endpoint", () => {
   before(async () => {
     ({ server, db, base } = await startServer());
 
-    const token1 = insertApprovedOwner(db, "statowner1");
-    await publishRaw(
+    const token1 = await insertApprovedOwner(db, "statowner1");
+    await publish(
       base,
       token1,
       buildPublishBody({ id: "statpkg", version: "0.1.0" }),
     );
-    await publishRaw(
+    await publish(
       base,
       token1,
       buildPublishBody({ id: "statpkg", version: "0.2.0" }),
     );
 
-    const token2 = insertApprovedOwner(db, "statowner2");
-    await publishRaw(
+    const token2 = await insertApprovedOwner(db, "statowner2");
+    await publish(
       base,
       token2,
       buildPublishBody({ id: "otherpkg", version: "1.0.0" }),
     );
 
-    const pendingToken = insertOwner(db, "statpendingowner");
-    await publishRaw(
+    const pendingToken = await insertOwner(db, "statpendingowner");
+    await publish(
       base,
       pendingToken,
       buildPublishBody({ id: "pendingpkg", version: "0.1.0" }),
@@ -1489,9 +1573,9 @@ describe("warp-registry v2 second pending publish guard", () => {
   });
 
   test("an unapproved owner is blocked from a second pending publish, then unblocked once approved", async () => {
-    const token = insertOwner(db, "pendingguard");
+    const token = await insertOwner(db, "pendingguard");
 
-    const aRes = await publishRaw(
+    const aRes = await publish(
       base,
       token,
       buildPublishBody({ id: "pkga", version: "0.1.0" }),
@@ -1499,7 +1583,7 @@ describe("warp-registry v2 second pending publish guard", () => {
     assert.equal(aRes.status, 201);
     assert.equal((await aRes.json()).extension.approved, false);
 
-    const bRes = await publishRaw(
+    const bRes = await publish(
       base,
       token,
       buildPublishBody({ id: "pkgb", version: "0.1.0" }),
@@ -1527,7 +1611,7 @@ describe("warp-registry v2 second pending publish guard", () => {
 
     approve("pendingguard", "pkga", "0.1.0", dataDir);
 
-    const bRetry = await publishRaw(
+    const bRetry = await publish(
       base,
       token,
       buildPublishBody({ id: "pkgb", version: "0.1.0" }),
@@ -1553,8 +1637,8 @@ describe("warp-registry v2 users endpoint", () => {
   });
 
   test("GET /v2/users returns paginated user list", async () => {
-    insertOwner(db, "user1");
-    insertOwner(db, "user2");
+    await insertOwner(db, "user1");
+    await insertOwner(db, "user2");
     const res = await fetch(`${base}/v2/users`);
     assert.equal(res.status, 200);
     const body = await res.json();
@@ -1564,7 +1648,7 @@ describe("warp-registry v2 users endpoint", () => {
   });
 
   test("GET /v2/users/:namespace returns a single user", async () => {
-    insertOwner(db, "singleuser");
+    await insertOwner(db, "singleuser");
     const res = await fetch(`${base}/v2/users/singleuser`);
     assert.equal(res.status, 200);
     const body = await res.json();
@@ -1614,7 +1698,7 @@ describe("warp-registry v2 user update and delete", () => {
 
   test("user cannot update another user", async () => {
     const { token } = await signup(base, "usera", "password123");
-    insertOwner(db, "userb");
+    await insertOwner(db, "userb");
     const res = await fetch(`${base}/v2/users/userb`, {
       method: "PATCH",
       headers: {
@@ -1627,8 +1711,8 @@ describe("warp-registry v2 user update and delete", () => {
   });
 
   test("admin can update any user", async () => {
-    const adminToken = insertAdmin(db, "adminuser");
-    insertOwner(db, "targetuser");
+    const adminToken = await insertAdmin(db, "adminuser");
+    await insertOwner(db, "targetuser");
     const res = await fetch(`${base}/v2/users/targetuser`, {
       method: "PATCH",
       headers: {
@@ -1678,8 +1762,8 @@ describe("warp-registry v2 extension update and delete", () => {
   });
 
   test("owner can update own extension meta", async () => {
-    const token = insertApprovedOwner(db, "extowner");
-    await publishRaw(base, token, buildPublishBody({ id: "myext" }));
+    const token = await insertApprovedOwner(db, "extowner");
+    await publish(base, token, buildPublishBody({ id: "myext" }));
 
     const res = await fetch(`${base}/v2/@extowner/myext`, {
       method: "PATCH",
@@ -1704,11 +1788,75 @@ describe("warp-registry v2 extension update and delete", () => {
     assert.equal(body.meta.name, "Updated Name");
   });
 
-  test("non-owner cannot update extension", async () => {
-    const ownerToken = insertApprovedOwner(db, "extowner2");
-    await publishRaw(base, ownerToken, buildPublishBody({ id: "secureext" }));
+  test("PATCH with a blob whose extracted id does not match is rejected", async () => {
+    const token = await insertApprovedOwner(db, "patchidowner");
+    await publish(base, token, buildPublishBody({ id: "patchidext" }));
 
-    const otherToken = insertApprovedOwner(db, "otherperson");
+    const res = await fetch(`${base}/v2/@patchidowner/patchidext`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        extensionBlob: buildPublishBody({ id: "differentid" }).extensionBlob,
+      }),
+    });
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error, /meta.id must match/i);
+  });
+
+  test("PATCH with a blob with a non-semver version is rejected", async () => {
+    const token = await insertApprovedOwner(db, "patchverowner");
+    await publish(base, token, buildPublishBody({ id: "patchverext" }));
+
+    const body = buildPublishBody({ id: "patchverext" });
+    body.extensionBlob = body.extensionBlob.replace(
+      'version: "0.1.0"',
+      'version: "not-a-version"',
+    );
+    const res = await fetch(`${base}/v2/@patchverowner/patchverext`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ extensionBlob: body.extensionBlob }),
+    });
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error, /valid semver/i);
+  });
+
+  test("PATCH with a blob can add a new version", async () => {
+    const token = await insertApprovedOwner(db, "patchnewver");
+    await publish(base, token, buildPublishBody({ id: "patchnewext" }));
+
+    const res = await fetch(`${base}/v2/@patchnewver/patchnewext`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        extensionBlob: buildPublishBody({
+          id: "patchnewext",
+          version: "0.2.0",
+        }).extensionBlob,
+      }),
+    });
+    assert.equal(res.status, 200);
+
+    const info = await fetch(`${base}/v2/@patchnewver/patchnewext`);
+    assert.equal(info.status, 200);
+    const infoBody = await info.json();
+    assert.ok(infoBody.versions.includes("0.2.0"));
+  });
+
+  test("non-owner cannot update extension", async () => {
+    const ownerToken = await insertApprovedOwner(db, "extowner2");
+    await publish(base, ownerToken, buildPublishBody({ id: "secureext" }));
+
+    const otherToken = await insertApprovedOwner(db, "otherperson");
     const res = await fetch(`${base}/v2/@extowner2/secureext`, {
       method: "PATCH",
       headers: {
@@ -1731,8 +1879,8 @@ describe("warp-registry v2 extension update and delete", () => {
   });
 
   test("owner can delete own extension", async () => {
-    const token = insertApprovedOwner(db, "delowner");
-    await publishRaw(base, token, buildPublishBody({ id: "delme" }));
+    const token = await insertApprovedOwner(db, "delowner");
+    await publish(base, token, buildPublishBody({ id: "delme" }));
 
     const res = await fetch(`${base}/v2/@delowner/delme`, {
       method: "DELETE",
@@ -1760,10 +1908,10 @@ describe("warp-registry v2 approve endpoint", () => {
   });
 
   test("admin can approve a pending extension", async () => {
-    const adminToken = insertAdmin(db, "adminapprove");
-    const userToken = insertOwner(db, "normaluser");
+    const adminToken = await insertAdmin(db, "adminapprove");
+    const userToken = await insertOwner(db, "normaluser");
 
-    await publishRaw(
+    await publish(
       base,
       userToken,
       buildPublishBody({ id: "pendext", version: "0.1.0" }),
@@ -1782,9 +1930,9 @@ describe("warp-registry v2 approve endpoint", () => {
   });
 
   test("non-admin cannot approve", async () => {
-    const userToken = insertOwner(db, "nonadmin");
-    const normalToken = insertApprovedOwner(db, "normalapprove");
-    await publishRaw(
+    const userToken = await insertOwner(db, "nonadmin");
+    const normalToken = await insertApprovedOwner(db, "normalapprove");
+    await publish(
       base,
       normalToken,
       buildPublishBody({ id: "unapproved", version: "0.1.0" }),
@@ -1798,7 +1946,7 @@ describe("warp-registry v2 approve endpoint", () => {
   });
 
   test("approve returns 404 for non-existent extension", async () => {
-    const adminToken = insertAdmin(db, "adminnoexist");
+    const adminToken = await insertAdmin(db, "adminnoexist");
     const res = await fetch(`${base}/v2/@nobody/noext/approve`, {
       method: "POST",
       headers: { Authorization: `Bearer ${adminToken}` },

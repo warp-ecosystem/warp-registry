@@ -138,7 +138,13 @@ A successful publish returns `201` with JSON describing the extension:
 
 A brand-new owner's **first** publish is held as `pending`. Pending versions are stored on disk and in the database but are not served over HTTP until approved — you'll get `404` from the info and blob endpoints until then.
 
-An **admin** can approve it through the API:
+An **admin** can approve it through the API, but the approving account must have admin privileges. To bootstrap the first admin, promote a user's row in the database. The database lives under the `DATA_DIR` you configured in `.env` (default `./data`):
+
+```bash
+sqlite3 $DATA_DIR/registry.db "UPDATE users SET type='admin' WHERE namespace='yourname';"
+```
+
+Then approve through the API:
 
 ```bash
 curl -X POST http://localhost:3000/v2/@yourname/helloworld/approve \
@@ -154,12 +160,6 @@ node scripts/approve.js yourname helloworld 0.1.0
 You should see a green `✓ Approved yourname/helloworld@0.1.0 (owner now has_published=1)`.
 
 After that first approval, **every publish from the same owner is `published` immediately** and needs no further approval.
-
-To make a given account an admin, update its row in the database:
-
-```bash
-sqlite3 data/registry.db "UPDATE users SET type='admin' WHERE namespace='yourname';"
-```
 
 ## 8. Confirm it's live
 
@@ -199,9 +199,40 @@ curl -X POST http://localhost:3000/v2/auth/logout \
   -H "Authorization: Bearer <your-token>"
 ```
 
+Changing your password revokes **all** issued tokens, so you'll need to log in again afterward:
+
+```bash
+curl -X PATCH http://localhost:3000/v2/users/yourname \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <your-token>" \
+  -d '{"password":"a-new-strong-password"}'
+```
+
 Delete your account (revokes all tokens and removes your published extensions):
 
 ```bash
 curl -X DELETE http://localhost:3000/v2/users/yourname \
   -H "Authorization: Bearer <your-token>"
 ```
+
+## 11. Passwords, sessions, and abuse protection
+
+- Passwords are salted and hashed with **scrypt** (asynchronously) on the server; only the hash is stored.
+- Auth tokens expire after **7 days**; `expires_at` is stored on each token and enforced on every authenticated request. A token whose password was changed is revoked immediately.
+- Login and signup are rate-limited: after **5 attempts within 15 minutes per namespace + IP address**, further attempts respond `429 Too Many Requests` — the check runs before any password hashing or verification. (IPv6/IPv4 addresses are counted separately; counters are in-memory and reset on restart.)
+
+## 12. Upgrading from the v1 (GitHub OAuth) registry
+
+The server auto-migrates a legacy v1 database (`owners` table) to the v2 schema on first startup:
+
+- Each `owners` row becomes a `users` row; the OAuth-derived `github_username` is normalized to the v2 namespace policy (lowercased, non-`[a-z0-9-]` characters replaced with a valid fallback, collisions de-duplicated with a numeric suffix).
+- v1 users authenticated via GitHub, so they have **no password** — migrated accounts cannot log in until an admin sets one. Recovery: bootstrap an admin (see step 7), then have the admin set a password:
+
+```bash
+curl -X PATCH http://localhost:3000/v2/users/themigrateduser \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <admin-token>" \
+  -d '{"password":"a-new-strong-password"}'
+```
+
+The migrated user can then log in normally; any existing approved extensions remain published and browsable meanwhile.

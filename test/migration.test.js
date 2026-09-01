@@ -30,7 +30,11 @@ test("v1 owners schema is migrated to v2 users schema", () => {
         UNIQUE (owner_id, package_id, version)
       );
       INSERT INTO owners (id, github_username, token_hash, has_published)
-        VALUES (1, 'olduser', 'hash', 1);
+        VALUES (1, 'OldUser', 'hash', 1);
+      INSERT INTO owners (id, github_username, token_hash, has_published)
+        VALUES (2, 'Mixed Case Name!', 'hash', 0);
+      INSERT INTO owners (id, github_username, token_hash, has_published)
+        VALUES (3, 'olduser', 'hash', 1);
       INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
         VALUES (1, 'oldpkg', '1.0.0', 'published', 'published', '{}', '/tmp/x.js');
     `);
@@ -51,6 +55,29 @@ test("v1 owners schema is migrated to v2 users schema", () => {
         .get();
       assert.ok(user, "migrated user must exist");
       assert.equal(user.has_published, 1);
+      assert.equal(
+        user.password_hash,
+        "",
+        "migrated users get empty password_hash and require recovery",
+      );
+
+      const normalized = ndb
+        .prepare("SELECT * FROM users WHERE namespace = 'user2'")
+        .get();
+      assert.ok(
+        normalized,
+        "invalid GitHub usernames are normalized to a valid lowercase namespace",
+      );
+
+      const users = ndb.prepare("SELECT COUNT(*) AS c FROM users").get().c;
+      assert.equal(users, 3, "all migrated rows are preserved");
+      const uniqueNamespaces = new Set(
+        ndb
+          .prepare("SELECT namespace FROM users")
+          .all()
+          .map((r) => r.namespace),
+      ).size;
+      assert.equal(uniqueNamespaces, 3, "name collisions are de-duplicated");
 
       const version = ndb
         .prepare("SELECT * FROM versions WHERE package_id = 'oldpkg'")

@@ -36,30 +36,80 @@ export function hashToken(token) {
 const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 };
 
 /**
- * Hashes a password using scrypt with a random salt.
- * @param {string} password - The password to hash.
- * @returns {string} The salt:hash pair in hex format.
+ * Lifetime of an issued auth token in milliseconds (7 days).
  */
-export function hashPassword(password) {
+const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Auth rate-limit configuration: at most MAX consecutive failed attempts over
+ * the window before the client is throttled with 429.
+ */
+const RATE_LIMIT_MAX = 5;
+const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+
+/**
+ * Simple in-memory rate limiter keyed by `namespace|ip`.
+ * Tracks failed attempts for a rolling window. Not sharded or persisted; a
+ * restart resets the counters.
+ */
+function createRateLimiter() {
+  const buckets = new Map();
+  function sweep() {
+    const now = Date.now();
+    for (const [key, entry] of buckets) {
+      if (now - entry.firstAttemptAt > RATE_LIMIT_WINDOW_MS) {
+        buckets.delete(key);
+      }
+    }
+  }
+  return {
+    onFailure(key, now = Date.now()) {
+      sweep();
+      let entry = buckets.get(key);
+      if (!entry) {
+        entry = { count: 0, firstAttemptAt: now };
+        buckets.set(key, entry);
+      }
+      entry.count += 1;
+      return entry.count >= RATE_LIMIT_MAX;
+    },
+    onSuccess(key) {
+      buckets.delete(key);
+    },
+  };
+}
+
+/**
+ * Hashes a password using scrypt with a random salt, asynchronously.
+ * @param {string} password - The password to hash.
+ * @returns {Promise<string>} A promise resolving to the salt:hash pair in hex format.
+ */
+export async function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString("hex");
-  const hash = crypto
-    .scryptSync(password, salt, 64, SCRYPT_PARAMS)
-    .toString("hex");
+  const hash = await new Promise((resolve, reject) => {
+    crypto.scrypt(password, salt, 64, SCRYPT_PARAMS, (err, derivedKey) => {
+      if (err) reject(err);
+      else resolve(derivedKey.toString("hex"));
+    });
+  });
   return `${salt}:${hash}`;
 }
 
 /**
- * Verifies a password against a stored hash.
+ * Verifies a password against a stored hash, asynchronously.
  * @param {string} password - The password to verify.
  * @param {string} stored - The stored salt:hash pair.
- * @returns {boolean} True if the password matches.
+ * @returns {Promise<boolean>} Resolves true if the password matches.
  */
-export function verifyPassword(password, stored) {
+export async function verifyPassword(password, stored) {
   const [salt, hash] = stored.split(":");
   if (!salt || !hash) return false;
-  const computed = crypto
-    .scryptSync(password, salt, 64, SCRYPT_PARAMS)
-    .toString("hex");
+  const computed = await new Promise((resolve, reject) => {
+    crypto.scrypt(password, salt, 64, SCRYPT_PARAMS, (err, derivedKey) => {
+      if (err) reject(err);
+      else resolve(derivedKey.toString("hex"));
+    });
+  });
   try {
     return crypto.timingSafeEqual(
       Buffer.from(hash, "hex"),
@@ -348,7 +398,16 @@ export function createApp({ db, dataDir }) {
 
   // ── Auth routes ──────────────────────────────────────────────────────
 
-  app.post("/v2/auth/signup", (req, res) => {
+  const rateLimiter = createRateLimiter();
+
+  const rateLimited = (res) => {
+    res.status(429).json({ error: "Too many attempts. Try again later." });
+  };
+
+  const clientIp = (req) =>
+    req.ip || (req.socket && req.socket.remoteAddress) || "unknown";
+
+  app.post("/v2/auth/signup", async (req, res) => {
     const { namespace, displayName, password } = req.body || {};
     if (!namespace || typeof namespace !== "string") {
       res.status(400).json({ error: "namespace is required." });
@@ -366,6 +425,16 @@ export function createApp({ db, dataDir }) {
         .json({ error: "password must be at least 8 characters." });
       return;
     }
+    if (displayName !== undefined && typeof displayName !== "string") {
+      res.status(400).json({ error: "displayName must be a string." });
+      return;
+    }
+
+    const rateKey = `signup:${namespace}|${clientIp(req)}`;
+    if (rateLimiter.onFailure(rateKey)) {
+      rateLimited(res);
+      return;
+    }
 
     const existing = db
       .prepare("SELECT id FROM users WHERE namespace = ?")
@@ -375,7 +444,8 @@ export function createApp({ db, dataDir }) {
       return;
     }
 
-    const passwordHash = hashPassword(password);
+    const passwordHash = await hashPassword(password);
+
     const result = db
       .prepare(
         `INSERT INTO users (namespace, display_name, password_hash, type)
@@ -389,15 +459,16 @@ export function createApp({ db, dataDir }) {
 
     const token = crypto.randomBytes(32).toString("hex");
     const tokenHash = hashToken(token);
+    const expiresAt = new Date(Date.now() + TOKEN_TTL_MS).toISOString();
     db.prepare(
-      "INSERT INTO auth_tokens (user_id, token_hash) VALUES (?, ?)",
-    ).run(user.id, tokenHash);
+      "INSERT INTO auth_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+    ).run(user.id, tokenHash, expiresAt);
 
     success(`User signed up: ${namespace}`);
     res.status(201).json({ user: userResponse(user, db), token });
   });
 
-  app.post("/v2/auth/login", (req, res) => {
+  app.post("/v2/auth/login", async (req, res) => {
     const { namespace, password } = req.body || {};
     if (!namespace || typeof namespace !== "string") {
       res.status(400).json({ error: "namespace is required." });
@@ -408,19 +479,28 @@ export function createApp({ db, dataDir }) {
       return;
     }
 
-    const user = db
-      .prepare("SELECT * FROM users WHERE namespace = ?")
-      .get(namespace);
-    if (!user || !verifyPassword(password, user.password_hash)) {
-      res.status(401).json({ error: "Invalid credentials." });
+    const rateKey = `login:${namespace}|${clientIp(req)}`;
+    if (rateLimiter.onFailure(rateKey)) {
+      rateLimited(res);
       return;
     }
 
+    const user = db
+      .prepare("SELECT * FROM users WHERE namespace = ?")
+      .get(namespace);
+    const ok = user && (await verifyPassword(password, user.password_hash));
+    if (!user || !ok) {
+      res.status(401).json({ error: "Invalid credentials." });
+      return;
+    }
+    rateLimiter.onSuccess(rateKey);
+
     const token = crypto.randomBytes(32).toString("hex");
     const tokenHash = hashToken(token);
+    const expiresAt = new Date(Date.now() + TOKEN_TTL_MS).toISOString();
     db.prepare(
-      "INSERT INTO auth_tokens (user_id, token_hash) VALUES (?, ?)",
-    ).run(user.id, tokenHash);
+      "INSERT INTO auth_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+    ).run(user.id, tokenHash, expiresAt);
 
     success(`User logged in: ${namespace}`);
     res.status(200).json({ user: userResponse(user, db), token });
@@ -481,7 +561,7 @@ export function createApp({ db, dataDir }) {
     res.json(userResponse(user, db));
   });
 
-  app.patch("/v2/users/:namespace", (req, res) => {
+  app.patch("/v2/users/:namespace", async (req, res) => {
     const auth = authenticate(db, req.headers.authorization);
     if (!auth) {
       res.status(401).json({ error: "Unauthorized." });
@@ -505,6 +585,20 @@ export function createApp({ db, dataDir }) {
       return;
     }
 
+    if (displayName !== undefined && typeof displayName !== "string") {
+      res.status(400).json({ error: "displayName must be a string." });
+      return;
+    }
+    if (
+      password !== undefined &&
+      (typeof password !== "string" || password.length < 8)
+    ) {
+      res.status(400).json({
+        error: "password must be at least 8 characters.",
+      });
+      return;
+    }
+
     if (displayName !== undefined) {
       db.prepare("UPDATE users SET display_name = ? WHERE id = ?").run(
         displayName,
@@ -512,16 +606,12 @@ export function createApp({ db, dataDir }) {
       );
     }
     if (password !== undefined) {
-      if (typeof password !== "string" || password.length < 8) {
-        res.status(400).json({
-          error: "password must be at least 8 characters.",
-        });
-        return;
-      }
+      const passwordHash = await hashPassword(password);
       db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(
-        hashPassword(password),
+        passwordHash,
         target.id,
       );
+      db.prepare("DELETE FROM auth_tokens WHERE user_id = ?").run(target.id);
     }
 
     const updated = db
@@ -548,29 +638,23 @@ export function createApp({ db, dataDir }) {
       return;
     }
 
-    const extensions = db
+    const versions = db
       .prepare(
-        `SELECT DISTINCT package_id FROM versions
+        `SELECT version, blob_path FROM versions
          WHERE owner_id = ?`,
       )
-      .all(target.id)
-      .map((r) => r.package_id);
+      .all(target.id);
 
-    for (const packageId of extensions) {
-      const versions = db
-        .prepare(
-          `SELECT version, blob_path FROM versions
-           WHERE owner_id = ? AND package_id = ?`,
-        )
-        .all(target.id, packageId);
-      for (const v of versions) {
-        fs.rmSync(v.blob_path, { force: true });
-      }
+    const deleteUser = db.transaction((id) => {
+      db.prepare("DELETE FROM auth_tokens WHERE user_id = ?").run(id);
+      db.prepare("DELETE FROM versions WHERE owner_id = ?").run(id);
+      db.prepare("DELETE FROM users WHERE id = ?").run(id);
+    });
+    deleteUser(target.id);
+
+    for (const v of versions) {
+      fs.rmSync(v.blob_path, { force: true });
     }
-
-    db.prepare("DELETE FROM auth_tokens WHERE user_id = ?").run(target.id);
-    db.prepare("DELETE FROM versions WHERE owner_id = ?").run(target.id);
-    db.prepare("DELETE FROM users WHERE id = ?").run(target.id);
 
     res.status(200).json({ message: "Deleted." });
   });
@@ -605,21 +689,25 @@ export function createApp({ db, dataDir }) {
     }
 
     const source = extensionBlob;
-    const { ok, error: metaError } = extractWarpMeta(source);
+    const {
+      ok,
+      meta: extractedMeta,
+      error: metaError,
+    } = extractWarpMeta(source);
     if (!ok) {
       res.status(400).json({ error: metaError });
       error(metaError);
       return;
     }
 
-    if (meta.id !== id) {
+    if (extractedMeta.id !== id) {
       res.status(400).json({
         error: "meta.id must match the request id.",
       });
       return;
     }
 
-    const version = semver.valid(meta.version);
+    const version = semver.valid(extractedMeta.version);
     if (version === null) {
       res.status(400).json({
         error: "meta.version must be a valid semver string.",
@@ -628,7 +716,10 @@ export function createApp({ db, dataDir }) {
       return;
     }
     for (const field of ["name", "license", "description"]) {
-      if (typeof meta[field] !== "string" || meta[field].length === 0) {
+      if (
+        typeof extractedMeta[field] !== "string" ||
+        extractedMeta[field].length === 0
+      ) {
         res.status(400).json({
           error: `meta.${field} is required and must be a non-empty string.`,
         });
@@ -691,7 +782,7 @@ export function createApp({ db, dataDir }) {
             packageId,
             version,
             derivedStatus,
-            JSON.stringify(meta),
+            JSON.stringify(extractedMeta),
             absBlobPath,
           );
           fs.renameSync(tempBlobPath, absBlobPath);
@@ -757,7 +848,7 @@ export function createApp({ db, dataDir }) {
       extension: {
         owner: ownerName,
         id: packageId,
-        meta,
+        meta: extractedMeta,
         versions,
         approved: finalStatus === "published",
       },
@@ -868,7 +959,30 @@ export function createApp({ db, dataDir }) {
         finalMeta = extractedMeta;
       }
 
-      const version = finalMeta.version || "0.0.0";
+      if (!PACKAGE_ID_RE.test(id)) {
+        res.status(400).json({
+          error: "id must match ^[a-z0-9](?:[a-z0-9._-]{0,63})$.",
+        });
+        return;
+      }
+      if (!finalMeta || typeof finalMeta !== "object") {
+        res
+          .status(400)
+          .json({ error: "meta is required when uploading a blob." });
+        return;
+      }
+      const version = semver.valid(finalMeta.version);
+      if (version === null) {
+        res.status(400).json({
+          error: "meta.version must be a valid semver string.",
+        });
+        return;
+      }
+      if (finalMeta.id !== id) {
+        res.status(400).json({ error: "meta.id must match the request id." });
+        return;
+      }
+
       const absBlobPath = blobPath(dataDir, namespace, id, version);
       fs.mkdirSync(path.dirname(absBlobPath), { recursive: true });
       fs.writeFileSync(absBlobPath, extensionBlob);
@@ -878,11 +992,49 @@ export function createApp({ db, dataDir }) {
           `SELECT id FROM versions WHERE owner_id = ? AND package_id = ? AND version = ?`,
         )
         .get(target.id, id, version);
-      if (!existingVersion) {
+      if (existingVersion) {
+        db.prepare(
+          "UPDATE versions SET meta_json = ?, blob_path = ? WHERE id = ?",
+        ).run(JSON.stringify(finalMeta), absBlobPath, existingVersion.id);
+      } else {
+        const current = db
+          .prepare("SELECT has_published FROM users WHERE id = ?")
+          .get(target.id);
+        const derivedStatus =
+          current.has_published === 1 ? "published" : "pending";
+
+        const blocked =
+          current.has_published !== 1 &&
+          db
+            .prepare(
+              `SELECT id FROM versions
+               WHERE owner_id = ? AND status IN ('staging', 'pending')
+                 AND NOT (package_id = ? AND version = ?)`,
+            )
+            .get(target.id, id, version);
+        if (blocked) {
+          fs.rmSync(absBlobPath, { force: true });
+          res.status(409).json({
+            error:
+              "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+          });
+          return;
+        }
+
         db.prepare(
           `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
-           VALUES (?, ?, ?, 'published', 'published', ?, ?)`,
-        ).run(target.id, id, version, JSON.stringify(finalMeta), absBlobPath);
+           VALUES (?, ?, ?, 'staging', ?, ?, ?)`,
+        ).run(
+          target.id,
+          id,
+          version,
+          derivedStatus,
+          JSON.stringify(finalMeta),
+          absBlobPath,
+        );
+        db.prepare(
+          `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
+        ).run(derivedStatus, target.id, id, version);
       }
     }
 
