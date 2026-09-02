@@ -429,6 +429,29 @@ function userResponse(row, db) {
 }
 
 /**
+ * Decodes and validates an opaque pagination cursor.
+ * A cursor is a base64-encoded JSON object. Returns `{ ok: false }` when the
+ * cursor is malformed or fails the caller-supplied shape validation, otherwise
+ * `{ ok: true, value }` where `value` is null when no cursor was provided.
+ * @param {string|undefined} raw - The raw query parameter value.
+ * @param {(decoded: object) => boolean} validate - Shape validation predicate.
+ * @returns {{ ok: boolean, value?: object|null }}
+ */
+function decodeCursor(raw, validate) {
+  if (raw === undefined || raw === "") return { ok: true, value: null };
+  let decoded;
+  try {
+    decoded = JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+  } catch {
+    return { ok: false };
+  }
+  if (!decoded || typeof decoded !== "object" || !validate(decoded)) {
+    return { ok: false };
+  }
+  return { ok: true, value: decoded };
+}
+
+/**
  * Creates and configures the Express application.
  * Sets up all v2 routes for auth, user management, publishing, and discovery.
  * @param {object} options - Configuration options.
@@ -611,27 +634,15 @@ export function createApp({ db, dataDir }) {
     }
     limit = Math.min(limit, 50);
 
-    let cursorId = null;
-    if (req.query.cursor !== undefined && req.query.cursor !== "") {
-      let decoded;
-      try {
-        decoded = JSON.parse(
-          Buffer.from(req.query.cursor, "base64").toString("utf8"),
-        );
-      } catch {
-        res.status(400).json({ error: "Invalid cursor." });
-        return;
-      }
-      if (
-        !decoded ||
-        typeof decoded !== "object" ||
-        typeof decoded.id !== "number"
-      ) {
-        res.status(400).json({ error: "Invalid cursor." });
-        return;
-      }
-      cursorId = decoded.id;
+    const cursor = decodeCursor(
+      req.query.cursor,
+      (d) => typeof d.id === "number",
+    );
+    if (!cursor.ok) {
+      res.status(400).json({ error: "Invalid cursor." });
+      return;
     }
+    const cursorId = cursor.value ? cursor.value.id : null;
 
     const where = cursorId !== null ? "WHERE id > ?" : "";
     const params = cursorId !== null ? [cursorId] : [];
@@ -1335,29 +1346,18 @@ export function createApp({ db, dataDir }) {
     const raw = typeof req.query.query === "string" ? req.query.query : "";
     const q = raw.trim();
 
-    let cursor = null;
-    if (req.query.cursor !== undefined && req.query.cursor !== "") {
-      let decoded;
-      try {
-        decoded = JSON.parse(
-          Buffer.from(req.query.cursor, "base64").toString("utf8"),
-        );
-      } catch {
-        res.status(400).json({ error: "Invalid cursor." });
-        return;
-      }
-      if (
-        !decoded ||
-        typeof decoded !== "object" ||
-        typeof decoded.createdAt !== "string" ||
-        typeof decoded.owner !== "string" ||
-        typeof decoded.packageId !== "string"
-      ) {
-        res.status(400).json({ error: "Invalid cursor." });
-        return;
-      }
-      cursor = decoded;
+    const decodedCursor = decodeCursor(
+      req.query.cursor,
+      (d) =>
+        typeof d.createdAt === "string" &&
+        typeof d.owner === "string" &&
+        typeof d.packageId === "string",
+    );
+    if (!decodedCursor.ok) {
+      res.status(400).json({ error: "Invalid cursor." });
+      return;
     }
+    const cursor = decodedCursor.value;
 
     let where = "WHERE t.rn = 1";
     const params = [];
@@ -1445,29 +1445,18 @@ export function createApp({ db, dataDir }) {
     }
     limit = Math.min(limit, 50);
 
-    let cursor = null;
-    if (req.query.cursor !== undefined && req.query.cursor !== "") {
-      let decoded;
-      try {
-        decoded = JSON.parse(
-          Buffer.from(req.query.cursor, "base64").toString("utf8"),
-        );
-      } catch {
-        res.status(400).json({ error: "Invalid cursor." });
-        return;
-      }
-      if (
-        !decoded ||
-        typeof decoded !== "object" ||
-        typeof decoded.createdAt !== "string" ||
-        typeof decoded.owner !== "string" ||
-        typeof decoded.packageId !== "string"
-      ) {
-        res.status(400).json({ error: "Invalid cursor." });
-        return;
-      }
-      cursor = decoded;
+    const decodedCursor = decodeCursor(
+      req.query.cursor,
+      (d) =>
+        typeof d.createdAt === "string" &&
+        typeof d.owner === "string" &&
+        typeof d.packageId === "string",
+    );
+    if (!decodedCursor.ok) {
+      res.status(400).json({ error: "Invalid cursor." });
+      return;
     }
+    const cursor = decodedCursor.value;
 
     let where = "WHERE t.rn = 1";
     const params = [];

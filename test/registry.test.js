@@ -1274,11 +1274,12 @@ describe("warp-registry v2 search pagination", () => {
       const owner = `spg${String(i).padStart(2, "0")}`;
       const token = await insertApprovedOwner(db, owner);
       const id = `spkg${String(i).padStart(2, "0")}`;
-      await publish(
+      const res = await publish(
         base,
         token,
         buildPublishBody({ id, name: `Search Pkg ${i}` }),
       );
+      assert.equal(res.status, 201);
       setCreatedAt(owner, id, `2024-03-${String(i).padStart(2, "0")} 10:00:00`);
     }
   });
