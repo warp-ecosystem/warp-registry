@@ -74,6 +74,39 @@ function createRateLimiter() {
 }
 
 /**
+ * Per-IP limiter that counts successful signup requests. Unlike
+ * createRateLimiter, failed/rejected attempts do not count; only successful
+ * account creations consume the bucket so an IP cannot churn out unlimited
+ * accounts within the window.
+ */
+function createSignupLimiter() {
+  const buckets = new Map();
+  function sweep(now = Date.now()) {
+    for (const [key, entry] of buckets) {
+      if (now - entry.firstAt > RATE_LIMIT_WINDOW_MS) {
+        buckets.delete(key);
+      }
+    }
+  }
+  return {
+    isLimited(key, now = Date.now()) {
+      sweep(now);
+      const entry = buckets.get(key);
+      return !!entry && entry.count >= RATE_LIMIT_MAX;
+    },
+    recordSuccess(key, now = Date.now()) {
+      sweep(now);
+      const entry = buckets.get(key);
+      if (entry) {
+        entry.count += 1;
+      } else {
+        buckets.set(key, { count: 1, firstAt: now });
+      }
+    },
+  };
+}
+
+/**
  * Hashes a password using scrypt with a random salt, asynchronously.
  * @param {string} password - The password to hash.
  * @returns {Promise<string>} A promise resolving to the salt:hash pair in hex format.
@@ -393,6 +426,7 @@ export function createApp({ db, dataDir }) {
   // ── Auth routes ──────────────────────────────────────────────────────
 
   const rateLimiter = createRateLimiter();
+  const signupLimiter = createSignupLimiter();
 
   const rateLimited = (res) => {
     res.status(429).json({ error: "Too many attempts. Try again later." });
@@ -403,29 +437,36 @@ export function createApp({ db, dataDir }) {
 
   app.post("/v2/auth/signup", async (req, res) => {
     const { namespace, displayName, password } = req.body || {};
+    const rateKey = `signup:${clientIp(req)}`;
+    const reject = (status, error) => {
+      if (rateLimiter.onFailure(rateKey)) {
+        rateLimited(res);
+        return;
+      }
+      res.status(status).json({ error });
+    };
+
     if (!namespace || typeof namespace !== "string") {
-      res.status(400).json({ error: "namespace is required." });
+      reject(400, "namespace is required.");
       return;
     }
     if (!NAMESPACE_RE.test(namespace)) {
-      res.status(400).json({
-        error: "namespace must match ^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$.",
-      });
+      reject(
+        400,
+        "namespace must match ^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$.",
+      );
       return;
     }
     if (!password || typeof password !== "string" || password.length < 8) {
-      res
-        .status(400)
-        .json({ error: "password must be at least 8 characters." });
+      reject(400, "password must be at least 8 characters.");
       return;
     }
     if (displayName !== undefined && typeof displayName !== "string") {
-      res.status(400).json({ error: "displayName must be a string." });
+      reject(400, "displayName must be a string.");
       return;
     }
 
-    const rateKey = `signup:${clientIp(req)}`;
-    if (rateLimiter.onFailure(rateKey)) {
+    if (signupLimiter.isLimited(rateKey)) {
       rateLimited(res);
       return;
     }
@@ -434,7 +475,7 @@ export function createApp({ db, dataDir }) {
       .prepare("SELECT id FROM users WHERE namespace = ?")
       .get(namespace);
     if (existing) {
-      res.status(409).json({ error: "Namespace already exists." });
+      reject(409, "Namespace already exists.");
       return;
     }
 
@@ -450,13 +491,13 @@ export function createApp({ db, dataDir }) {
         .run(namespace, displayName || "", passwordHash);
     } catch (err) {
       if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
-        res.status(409).json({ error: "Namespace already exists." });
+        reject(409, "Namespace already exists.");
         return;
       }
       throw err;
     }
 
-    rateLimiter.onSuccess(rateKey);
+    signupLimiter.recordSuccess(rateKey);
 
     const user = db
       .prepare("SELECT * FROM users WHERE id = ?")

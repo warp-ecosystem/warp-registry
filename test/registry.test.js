@@ -392,25 +392,28 @@ describe("warp-registry v2 auth hardening", () => {
   });
 
   test("signup is throttled with 429 after repeated attempts", async () => {
-    await signup(base, "ratelimitsignup");
+    const fresh = await startServer();
+    try {
+      const attempt = (namespace) =>
+        fetch(`${fresh.base}/v2/auth/signup`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ namespace, password: "password1234" }),
+        });
 
-    const attempt = (namespace) =>
-      fetch(`${base}/v2/auth/signup`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ namespace, password: "password1234" }),
-      });
-
-    assert.equal((await attempt("ratelimitsignup")).status, 409);
-    assert.equal((await attempt("ratelimitsignup")).status, 409);
-    assert.equal((await attempt("ratelimitsignup")).status, 409);
-    assert.equal((await attempt("ratelimitsignup")).status, 409);
-    assert.equal((await attempt("ratelimitsignup")).status, 429);
-    assert.equal(
-      (await attempt("ratelimitfresh")).status,
-      429,
-      "signup throttling is keyed by client IP, so a namespace never attempted before is throttled too once the bucket is exhausted",
-    );
+      for (let i = 1; i <= 4; i += 1) {
+        assert.equal((await attempt(`ratelimit-s${i}`)).status, 201);
+      }
+      assert.equal((await attempt("ratelimit-s5")).status, 201);
+      assert.equal(
+        (await attempt("ratelimit-s6")).status,
+        429,
+        "signup throttling is keyed by client IP, so a namespace never attempted before is throttled too once the bucket is exhausted",
+      );
+    } finally {
+      await closeServer(fresh.server);
+      fresh.db.close();
+    }
   });
 });
 
