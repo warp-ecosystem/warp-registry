@@ -415,6 +415,41 @@ describe("warp-registry v2 auth hardening", () => {
       fresh.db.close();
     }
   });
+
+  test("concurrent signups from one IP cannot exceed the signup limit", async () => {
+    const fresh = await startServer();
+    try {
+      const attempts = [];
+      for (let i = 0; i < 12; i += 1) {
+        attempts.push(
+          fetch(`${fresh.base}/v2/auth/signup`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              namespace: `concurrent-s${i}`,
+              password: "password1234",
+            }),
+          }),
+        );
+      }
+
+      const results = await Promise.all(attempts);
+      const created = results.filter((r) => r.status === 201);
+      const throttled = results.filter((r) => r.status === 429);
+      assert.equal(
+        created.length,
+        5,
+        "at most RATE_LIMIT_MAX concurrent signups may succeed",
+      );
+      assert.ok(
+        throttled.length > 0,
+        "the remaining concurrent signups are throttled",
+      );
+    } finally {
+      await closeServer(fresh.server);
+      fresh.db.close();
+    }
+  });
 });
 
 describe("warp-registry v2 publish flow", () => {

@@ -99,13 +99,35 @@ function createSignupLimiter() {
       const entry = buckets.get(key);
       return !!entry && entry.count >= RATE_LIMIT_MAX;
     },
+    reserve(key, now = Date.now()) {
+      sweep(now);
+      const entry = buckets.get(key);
+      if (!entry) {
+        buckets.set(key, { count: 0, reserved: 1, firstAt: now });
+        return true;
+      }
+      if (entry.count + entry.reserved >= RATE_LIMIT_MAX) {
+        return false;
+      }
+      entry.reserved += 1;
+      return true;
+    },
+    release(key) {
+      const entry = buckets.get(key);
+      if (entry && entry.reserved > 0) {
+        entry.reserved -= 1;
+      }
+    },
     recordSuccess(key, now = Date.now()) {
       sweep(now);
       const entry = buckets.get(key);
       if (entry) {
         entry.count += 1;
+        if (entry.reserved > 0) {
+          entry.reserved -= 1;
+        }
       } else {
-        buckets.set(key, { count: 1, firstAt: now });
+        buckets.set(key, { count: 1, reserved: 0, firstAt: now });
       }
     },
   };
