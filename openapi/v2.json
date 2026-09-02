@@ -62,6 +62,9 @@
           },
           "409": {
             "description": "Namespace already exists"
+          },
+          "429": {
+            "description": "Too many attempts. Try again later."
           }
         }
       }
@@ -98,6 +101,9 @@
           },
           "401": {
             "description": "Invalid credentials"
+          },
+          "429": {
+            "description": "Too many attempts. Try again later."
           }
         }
       }
@@ -553,7 +559,7 @@
             }
           },
           "400": {
-            "description": "Missing/invalid query"
+            "description": "Invalid cursor"
           }
         }
       }
