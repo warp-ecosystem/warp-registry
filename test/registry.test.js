@@ -2041,6 +2041,54 @@ describe("warp-registry v2 extension update and delete", () => {
     assert.ok(infoBody.versions.includes("0.2.0"));
   });
 
+  test("PATCH persists the blob's extracted meta, not a mismatched request meta", async () => {
+    const token = await insertApprovedOwner(db, "patchmaowner");
+    await publish(base, token, buildPublishBody({ id: "patchmaext" }));
+
+    const blob = buildPublishBody({
+      id: "patchmaext",
+      version: "0.3.0",
+      name: "Blob-Derived Name",
+    }).extensionBlob;
+
+    const res = await fetch(`${base}/v2/@patchmaowner/patchmaext`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        meta: {
+          class: "X",
+          name: "Client-Supplied Name",
+          id: "patchmaext",
+          license: "MIT",
+          authors: [],
+          description: "x",
+          version: "0.3.0",
+        },
+        extensionBlob: blob,
+      }),
+    });
+    assert.equal(res.status, 200);
+
+    const row = db
+      .prepare(
+        `SELECT v.meta_json FROM versions v
+         JOIN users u ON u.id = v.owner_id
+         WHERE u.namespace = 'patchmaowner' AND v.package_id = 'patchmaext'
+           AND v.version = '0.3.0'`,
+      )
+      .get();
+    assert.ok(row, "the blob version must be persisted");
+    const storedMeta = JSON.parse(row.meta_json);
+    assert.equal(
+      storedMeta.name,
+      "Blob-Derived Name",
+      "metadata must come from the blob, not the client-supplied meta",
+    );
+  });
+
   test("non-owner cannot update extension", async () => {
     const ownerToken = await insertApprovedOwner(db, "extowner2");
     await publish(base, ownerToken, buildPublishBody({ id: "secureext" }));

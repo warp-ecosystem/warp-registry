@@ -497,11 +497,16 @@ export function createApp({ db, dataDir }) {
       rateLimited(res);
       return;
     }
+    if (!signupLimiter.reserve(rateKey)) {
+      rateLimited(res);
+      return;
+    }
 
     const existing = db
       .prepare("SELECT id FROM users WHERE namespace = ?")
       .get(namespace);
     if (existing) {
+      signupLimiter.release(rateKey);
       reject(409, "Namespace already exists.");
       return;
     }
@@ -517,6 +522,7 @@ export function createApp({ db, dataDir }) {
         )
         .run(namespace, displayName || "", passwordHash);
     } catch (err) {
+      signupLimiter.release(rateKey);
       if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
         reject(409, "Namespace already exists.");
         return;
@@ -1070,9 +1076,7 @@ export function createApp({ db, dataDir }) {
         res.status(400).json({ error: metaError });
         return;
       }
-      if (meta === undefined) {
-        finalMeta = extractedMeta;
-      }
+      finalMeta = extractedMeta;
 
       if (!PACKAGE_ID_RE.test(id)) {
         res.status(400).json({
