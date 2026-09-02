@@ -47,20 +47,14 @@ CREATE TABLE IF NOT EXISTS versions (
 `;
 
 /**
- * Migrates the database schema from v1 (owners) to v2 (users).
- * Only runs if the old owners table exists and the new users table does not.
- * Wraps the migration in a transaction for safety.
+ * Migrates an existing v1 database from owners to users.
  *
- * Recovered-account note: v1 owners authenticated via GitHub OAuth, so they have
- * no password. The migration copies them with an empty password_hash. A migrated
- * account cannot log in with a password and instead requires a one-time recovery:
+ * Creates users with normalized unique namespaces, preserves publication status,
+ * assigns empty password hashes, adds authentication tokens, and updates version
+ * records to reference users. The migration runs only when an owners table exists
+ * and a users table does not.
  *
- *   1. An admin sets a password via the CLI, or the account owner uses
- *      `PATCH /v2/users/:namespace` (requires an admin-issued token) to set one.
- *
- * Until a password is set the account cannot authenticate through the normal login flow.
- *
- * @param {import('better-sqlite3').Database} db - The database instance.
+ * @throws {Error} If the migration fails.
  */
 function migrateSchema(db) {
   const hasUsers = db
@@ -148,10 +142,9 @@ function migrateSchema(db) {
 }
 
 /**
- * Opens or creates a SQLite database in the specified data directory.
- * Applies the schema and runs any necessary migrations.
+ * Opens or creates the registry database and prepares its schema.
  * @param {string} dataDir - The directory where the database should be stored.
- * @returns {import('better-sqlite3').Database} The opened database instance.
+ * @returns {import('better-sqlite3').Database} The prepared database connection.
  */
 export function openDatabase(dataDir) {
   fs.mkdirSync(dataDir, { recursive: true });

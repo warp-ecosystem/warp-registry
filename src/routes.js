@@ -47,12 +47,14 @@ const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const SEARCH_PAGE_SIZE = 10;
 
 /**
- * Simple in-memory rate limiter keyed by `namespace|ip`.
- * Tracks failed attempts for a rolling window. Not sharded or persisted; a
- * restart resets the counters.
+ * Creates an in-memory rate limiter for failed attempts.
+ * @returns {Object} A rate limiter with methods for recording failures and clearing successful keys.
  */
 function createRateLimiter() {
   const buckets = new Map();
+  /**
+   * Removes rate-limit entries whose tracking window has expired.
+   */
   function sweep() {
     const now = Date.now();
     for (const [key, entry] of buckets) {
@@ -79,13 +81,16 @@ function createRateLimiter() {
 }
 
 /**
- * Per-IP limiter that counts successful signup requests. Unlike
- * createRateLimiter, failed/rejected attempts do not count; only successful
- * account creations consume the bucket so an IP cannot churn out unlimited
- * accounts within the window.
+ * Creates an in-memory rate limiter for successful signup requests.
+ *
+ * @returns {{isLimited: function, reserve: function, release: function, recordSuccess: function}} Limiter operations for checking, reserving, releasing, and recording signup attempts.
  */
 function createSignupLimiter() {
   const buckets = new Map();
+  /**
+   * Removes rate-limit buckets whose windows have expired.
+   * @param {number} now - Current timestamp in milliseconds.
+   */
   function sweep(now = Date.now()) {
     for (const [key, entry] of buckets) {
       if (now - entry.firstAt > RATE_LIMIT_WINDOW_MS) {
@@ -134,9 +139,9 @@ function createSignupLimiter() {
 }
 
 /**
- * Hashes a password using scrypt with a random salt, asynchronously.
+ * Creates a salted password hash suitable for storage.
  * @param {string} password - The password to hash.
- * @returns {Promise<string>} A promise resolving to the salt:hash pair in hex format.
+ * @returns {Promise<string>} The salt and hash as hexadecimal values separated by a colon.
  */
 export async function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString("hex");
@@ -150,10 +155,10 @@ export async function hashPassword(password) {
 }
 
 /**
- * Verifies a password against a stored hash, asynchronously.
+ * Checks whether a password matches a stored credential hash.
  * @param {string} password - The password to verify.
- * @param {string} stored - The stored salt:hash pair.
- * @returns {Promise<boolean>} Resolves true if the password matches.
+ * @param {string} stored - The stored salt and hash pair.
+ * @returns {boolean} `true` if the password matches, `false` otherwise.
  */
 export async function verifyPassword(password, stored) {
   const [salt, hash] = stored.split(":");
@@ -349,15 +354,13 @@ function unicodeFold(value) {
 const unicodeFoldRegistered = new WeakSet();
 
 /**
- * Detects a violation of the partial unique index that allows at most one
- * staging or pending version per owner, distinguishing it from the per-version
- * uniqueness constraint.
- * @param {unknown} err - The error thrown by better-sqlite3.
+ * Determines whether a publishing error represents a conflicting staging or pending version for the owner.
+ * @param {unknown} err - The database error raised during publishing.
  * @param {import('better-sqlite3').Database} db - The database instance.
- * @param {number} ownerId - The id of the owner performing the publish.
- * @param {string} packageId - The package id being published.
+ * @param {number} ownerId - The owner's database ID.
+ * @param {string} packageId - The package ID being published.
  * @param {string} version - The version being published.
- * @returns {boolean} True if the error is the one-pending-per-owner violation.
+ * @returns {boolean} `true` if another staging or pending version exists for the owner, `false` otherwise.
  */
 function isPendingConflict(err, db, ownerId, packageId, version) {
   if (
@@ -380,10 +383,9 @@ function isPendingConflict(err, db, ownerId, packageId, version) {
 }
 
 /**
- * Authenticates a request by extracting and validating the Bearer token.
- * @param {import('better-sqlite3').Database} db - The database instance.
- * @param {string} authHeader - The Authorization header value.
- * @returns {{user: object, tokenHash: string}|null} The authenticated user and token hash, or null.
+ * Authenticates a request using its Bearer token.
+ * @param {string} authHeader - The request's Authorization header.
+ * @returns {{user: object, tokenHash: string}|null} The authenticated user and token hash, or `null` for an invalid or expired token.
  */
 function authenticate(db, authHeader) {
   const match = /^Bearer\s+(.+)$/i.exec(authHeader || "");
