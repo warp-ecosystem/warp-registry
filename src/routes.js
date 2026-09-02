@@ -42,6 +42,11 @@ const RATE_LIMIT_MAX = 5;
 const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 
 /**
+ * Fixed page size used for paginated /search results.
+ */
+const SEARCH_PAGE_SIZE = 10;
+
+/**
  * Simple in-memory rate limiter keyed by `namespace|ip`.
  * Tracks failed attempts for a rolling window. Not sharded or persisted; a
  * restart resets the counters.
@@ -578,22 +583,49 @@ export function createApp({ db, dataDir }) {
     }
     limit = Math.min(limit, 50);
 
-    let offset = 0;
-    if (req.query.offset !== undefined) {
-      const parsed = Number(req.query.offset);
-      if (!Number.isInteger(parsed) || parsed < 0) {
-        res
-          .status(400)
-          .json({ error: "offset must be a non-negative integer." });
+    let cursorId = null;
+    if (req.query.cursor !== undefined && req.query.cursor !== "") {
+      let decoded;
+      try {
+        decoded = JSON.parse(
+          Buffer.from(req.query.cursor, "base64").toString("utf8"),
+        );
+      } catch {
+        res.status(400).json({ error: "Invalid cursor." });
         return;
       }
-      offset = parsed;
+      if (
+        !decoded ||
+        typeof decoded !== "object" ||
+        typeof decoded.id !== "number"
+      ) {
+        res.status(400).json({ error: "Invalid cursor." });
+        return;
+      }
+      cursorId = decoded.id;
     }
 
+    const where = cursorId !== null ? "WHERE id > ?" : "";
+    const params = cursorId !== null ? [cursorId] : [];
+
     const rows = db
-      .prepare("SELECT * FROM users ORDER BY id ASC LIMIT ? OFFSET ?")
-      .all(limit, offset);
-    res.json({ users: rows.map((r) => userResponse(r, db)) });
+      .prepare(`SELECT * FROM users ${where} ORDER BY id ASC LIMIT ?`)
+      .all(...params, limit + 1);
+
+    const hasMore = rows.length > limit;
+    const page = rows.slice(0, limit);
+
+    let nextCursor = null;
+    if (hasMore) {
+      nextCursor = Buffer.from(
+        JSON.stringify({ id: page[page.length - 1].id }),
+      ).toString("base64");
+    }
+
+    res.json({
+      users: page.map((r) => userResponse(r, db)),
+      nextCursor,
+    });
   });
 
   app.get("/v2/users/:namespace", (req, res) => {
@@ -790,6 +822,21 @@ export function createApp({ db, dataDir }) {
       return;
     }
 
+    const pending = db
+      .prepare(
+        `SELECT id FROM versions
+         WHERE owner_id = ? AND status IN ('staging', 'pending')
+           AND NOT (package_id = ? AND version = ?)`,
+      )
+      .get(auth.user.id, packageId, version);
+    if (pending) {
+      res.status(403).json({
+        error:
+          "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+      });
+      return;
+    }
+
     const absBlobPath = blobPath(dataDir, ownerName, packageId, version);
     const tempBlobPath = `${absBlobPath}.tmp-${crypto
       .randomBytes(6)
@@ -842,7 +889,7 @@ export function createApp({ db, dataDir }) {
 
       if (outcome.blocked) {
         fs.rmSync(tempBlobPath, { force: true });
-        res.status(409).json({
+        res.status(403).json({
           error:
             "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
         });
@@ -862,7 +909,7 @@ export function createApp({ db, dataDir }) {
       }
       if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
         if (isPendingConflict(err, db, auth.user.id, packageId, version)) {
-          res.status(409).json({
+          res.status(403).json({
             error:
               "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
           });
@@ -1261,36 +1308,90 @@ export function createApp({ db, dataDir }) {
   app.get("/v2/search", (req, res) => {
     const raw = typeof req.query.query === "string" ? req.query.query : "";
     const q = raw.trim();
-    if (!q) {
-      res
-        .status(400)
-        .json({ error: "Missing required `query` query parameter." });
-      error("Missing required `query` query parameter.");
-      return;
+
+    let cursor = null;
+    if (req.query.cursor !== undefined && req.query.cursor !== "") {
+      let decoded;
+      try {
+        decoded = JSON.parse(
+          Buffer.from(req.query.cursor, "base64").toString("utf8"),
+        );
+      } catch {
+        res.status(400).json({ error: "Invalid cursor." });
+        return;
+      }
+      if (
+        !decoded ||
+        typeof decoded !== "object" ||
+        typeof decoded.createdAt !== "string" ||
+        typeof decoded.owner !== "string" ||
+        typeof decoded.packageId !== "string"
+      ) {
+        res.status(400).json({ error: "Invalid cursor." });
+        return;
+      }
+      cursor = decoded;
     }
-    const escaped = q
-      .replace(/\\/g, "\\\\")
-      .replace(/%/g, "\\%")
-      .replace(/_/g, "\\_");
-    const pattern = `%${escaped}%`;
+
+    let where = "WHERE t.rn = 1";
+    const params = [];
+    if (cursor) {
+      where += ` AND (
+        t.created_at < ? OR
+        (t.created_at = ? AND (t.owner > ? OR (t.owner = ? AND t.id > ?)))
+      )`;
+      params.push(
+        cursor.createdAt,
+        cursor.createdAt,
+        cursor.owner,
+        cursor.owner,
+        cursor.packageId,
+      );
+    }
+
+    if (q) {
+      const escaped = q
+        .replace(/\\/g, "\\\\")
+        .replace(/%/g, "\\%")
+        .replace(/_/g, "\\_");
+      const pattern = `%${escaped}%`;
+      where += ` AND (unicode_fold(json_extract(t.meta_json, '$.name'))
+                LIKE unicode_fold(?) ESCAPE '\\'
+              OR json_extract(t.meta_json, '$.version') LIKE ? ESCAPE '\\'
+              OR json_extract(t.meta_json, '$.license') LIKE ? ESCAPE '\\'
+              OR json_extract(t.meta_json, '$.description') LIKE ? ESCAPE '\\'
+              OR t.id LIKE ? ESCAPE '\\'
+              OR t.owner LIKE ? ESCAPE '\\')`;
+      params.push(pattern, pattern, pattern, pattern, pattern, pattern);
+    }
+
     const rows = db
       .prepare(
-        `SELECT owner, id, meta_json, latestVersion
+        `SELECT owner, id, meta_json, latestVersion, created_at
          FROM (${latestPublishedSelections}) t
-         WHERE t.rn = 1
-           AND (unicode_fold(json_extract(t.meta_json, '$.name'))
-                  LIKE unicode_fold(?) ESCAPE '\\'
-             OR json_extract(t.meta_json, '$.version') LIKE ? ESCAPE '\\'
-             OR json_extract(t.meta_json, '$.license') LIKE ? ESCAPE '\\'
-             OR json_extract(t.meta_json, '$.description') LIKE ? ESCAPE '\\'
-             OR t.id LIKE ? ESCAPE '\\'
-             OR t.owner LIKE ? ESCAPE '\\')
+         ${where}
          ORDER BY t.created_at DESC, t.owner ASC, t.id ASC
-         LIMIT 10`,
+         LIMIT ?`,
       )
-      .all(pattern, pattern, pattern, pattern, pattern, pattern);
+      .all(...params, SEARCH_PAGE_SIZE + 1);
+
+    const hasMore = rows.length > SEARCH_PAGE_SIZE;
+    const page = rows.slice(0, SEARCH_PAGE_SIZE);
+
+    let nextCursor = null;
+    if (hasMore) {
+      const last = page[page.length - 1];
+      nextCursor = Buffer.from(
+        JSON.stringify({
+          createdAt: last.created_at,
+          owner: last.owner,
+          packageId: last.id,
+        }),
+      ).toString("base64");
+    }
+
     res.json({
-      results: rows.map((r) => {
+      results: page.map((r) => {
         const meta = JSON.parse(r.meta_json);
         return {
           owner: r.owner,
@@ -1300,12 +1401,13 @@ export function createApp({ db, dataDir }) {
           latestVersion: r.latestVersion,
         };
       }),
+      nextCursor,
     });
   });
 
-  // ── Packages ─────────────────────────────────────────────────────────
+  // ── Extensions ───────────────────────────────────────────────────────
 
-  app.get("/v2/packages", (req, res) => {
+  app.get("/v2/extensions", (req, res) => {
     let limit = 20;
     if (req.query.limit !== undefined) {
       const parsed = Number(req.query.limit);
@@ -1383,7 +1485,7 @@ export function createApp({ db, dataDir }) {
     }
 
     res.json({
-      packages: page.map((r) => {
+      extensions: page.map((r) => {
         const meta = JSON.parse(r.meta_json);
         return {
           owner: r.owner,

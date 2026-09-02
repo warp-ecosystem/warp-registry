@@ -6,24 +6,43 @@
     "version": "1.0.0"
   },
   "servers": [
-    { "url": "https://warp.sdisk.us/v2", "description": "Production server" },
-    { "url": "https://warp.sdisk.us/ts", "description": "Testing server" }
+    {
+      "url": "https://warp.sdisk.us/v2",
+      "description": "Production server"
+    },
+    {
+      "url": "https://warp.sdisk.us/ts",
+      "description": "Testing server"
+    }
   ],
   "tags": [
-    { "name": "OPEN", "description": "Endpoints open for non-authenticated users" },
-    { "name": "USERSPACE", "description": "Endpoints requiring authenticated user token" },
-    { "name": "ADMINSPACE", "description": "Endpoints requiring admin privileges" }
+    {
+      "name": "OPEN",
+      "description": "Endpoints open for non-authenticated users"
+    },
+    {
+      "name": "USERSPACE",
+      "description": "Endpoints requiring authenticated user token"
+    },
+    {
+      "name": "ADMINSPACE",
+      "description": "Endpoints requiring admin privileges"
+    }
   ],
   "paths": {
     "/auth/signup": {
       "post": {
         "summary": "Create a user account and issue token",
-        "tags": ["OPEN"],
+        "tags": [
+          "OPEN"
+        ],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/SignupRequest" }
+              "schema": {
+                "$ref": "#/components/schemas/SignupRequest"
+              }
             }
           }
         },
@@ -32,24 +51,34 @@
             "description": "User created",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/AuthResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/AuthResponse"
+                }
               }
             }
           },
-          "400": { "description": "Bad request" },
-          "409": { "description": "Namespace already exists" }
+          "400": {
+            "description": "Bad request"
+          },
+          "409": {
+            "description": "Namespace already exists"
+          }
         }
       }
     },
     "/auth/login": {
       "post": {
         "summary": "Login with username/password and issue token",
-        "tags": ["OPEN"],
+        "tags": [
+          "OPEN"
+        ],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/LoginRequest" }
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
             }
           }
         },
@@ -58,30 +87,48 @@
             "description": "Login success",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/AuthResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/AuthResponse"
+                }
               }
             }
           },
-          "400": { "description": "Bad request" },
-          "401": { "description": "Invalid credentials" }
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Invalid credentials"
+          }
         }
       }
     },
     "/auth/logout": {
       "post": {
         "summary": "Revoke current token",
-        "tags": ["USERSPACE"],
-        "security": [{ "token": [] }],
+        "tags": [
+          "USERSPACE"
+        ],
+        "security": [
+          {
+            "token": []
+          }
+        ],
         "responses": {
-          "200": { "description": "Logged out" },
-          "401": { "description": "Unauthorized" }
+          "200": {
+            "description": "Logged out"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
         }
       }
     },
     "/users": {
       "get": {
         "summary": "Read list of users (paginated)",
-        "tags": ["OPEN"],
+        "tags": [
+          "OPEN"
+        ],
         "parameters": [
           {
             "name": "limit",
@@ -96,11 +143,12 @@
             }
           },
           {
-            "name": "offset",
+            "name": "cursor",
             "in": "query",
             "required": false,
-            "description": "Pagination offset (default 0)",
-            "schema": { "type": "integer", "minimum": 0, "default": 0 }
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -108,41 +156,67 @@
             "description": "Success",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/UsersResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/UsersResponse"
+                }
               }
             }
           },
-          "400": { "description": "Bad request" }
+          "400": {
+            "description": "Bad request"
+          }
         }
       }
     },
     "/users/{namespace}": {
       "get": {
         "summary": "Read user data",
-        "tags": ["OPEN"],
-        "parameters": [{ "$ref": "#/components/parameters/NamespaceParam" }],
+        "tags": [
+          "OPEN"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/NamespaceParam"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Success",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/User" }
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
               }
             }
           },
-          "404": { "description": "User not found" }
+          "404": {
+            "description": "User not found"
+          }
         }
       },
       "patch": {
         "summary": "Update own user (or any user if admin)",
-        "tags": ["USERSPACE"],
-        "security": [{ "token": [] }],
-        "parameters": [{ "$ref": "#/components/parameters/NamespaceParam" }],
+        "tags": [
+          "USERSPACE"
+        ],
+        "security": [
+          {
+            "token": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/NamespaceParam"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/UpdateUserRequest" }
+              "schema": {
+                "$ref": "#/components/schemas/UpdateUserRequest"
+              }
             }
           }
         },
@@ -151,34 +225,68 @@
             "description": "Updated",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/User" }
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
               }
             }
           },
-          "400": { "description": "Bad request" },
-          "401": { "description": "Unauthorized" },
-          "403": { "description": "Forbidden" },
-          "404": { "description": "User not found" }
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "User not found"
+          }
         }
       },
       "delete": {
         "summary": "Delete own user (or any user if admin)",
-        "tags": ["USERSPACE"],
-        "security": [{ "token": [] }],
-        "parameters": [{ "$ref": "#/components/parameters/NamespaceParam" }],
+        "tags": [
+          "USERSPACE"
+        ],
+        "security": [
+          {
+            "token": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/NamespaceParam"
+          }
+        ],
         "responses": {
-          "200": { "description": "Deleted" },
-          "401": { "description": "Unauthorized" },
-          "403": { "description": "Forbidden" },
-          "404": { "description": "User not found" }
+          "200": {
+            "description": "Deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "User not found"
+          }
         }
       }
     },
     "/publish": {
       "post": {
         "summary": "Publish an extension version",
-        "tags": ["USERSPACE"],
-        "security": [{ "token": [] }],
+        "tags": [
+          "USERSPACE"
+        ],
+        "security": [
+          {
+            "token": []
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -200,45 +308,76 @@
               }
             }
           },
-          "400": { "description": "Bad request" },
-          "401": { "description": "Unauthorized" },
-          "409": { "description": "Version already exists" }
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "409": {
+            "description": "Version already exists"
+          },
+          "403": {
+            "description": "Owner already has a version pending review; new publishes are blocked until it is approved"
+          }
         }
       }
     },
     "/@{namespace}/{id}": {
       "get": {
         "summary": "Read an extension by namespace and extension ID",
-        "tags": ["OPEN"],
+        "tags": [
+          "OPEN"
+        ],
         "parameters": [
-          { "$ref": "#/components/parameters/NamespaceParam" },
-          { "$ref": "#/components/parameters/ExtensionIdParam" }
+          {
+            "$ref": "#/components/parameters/NamespaceParam"
+          },
+          {
+            "$ref": "#/components/parameters/ExtensionIdParam"
+          }
         ],
         "responses": {
           "200": {
             "description": "Success",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Extension" }
+                "schema": {
+                  "$ref": "#/components/schemas/Extension"
+                }
               }
             }
           },
-          "404": { "description": "Extension not found" }
+          "404": {
+            "description": "Extension not found"
+          }
         }
       },
       "patch": {
         "summary": "Update own extension (or any extension if admin)",
-        "tags": ["USERSPACE"],
-        "security": [{ "token": [] }],
+        "tags": [
+          "USERSPACE"
+        ],
+        "security": [
+          {
+            "token": []
+          }
+        ],
         "parameters": [
-          { "$ref": "#/components/parameters/NamespaceParam" },
-          { "$ref": "#/components/parameters/ExtensionIdParam" }
+          {
+            "$ref": "#/components/parameters/NamespaceParam"
+          },
+          {
+            "$ref": "#/components/parameters/ExtensionIdParam"
+          }
         ],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/UpdateExtensionRequest" }
+              "schema": {
+                "$ref": "#/components/schemas/UpdateExtensionRequest"
+              }
             }
           }
         },
@@ -247,85 +386,159 @@
             "description": "Updated",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Extension" }
+                "schema": {
+                  "$ref": "#/components/schemas/Extension"
+                }
               }
             }
           },
-          "400": { "description": "Bad request" },
-          "401": { "description": "Unauthorized" },
-          "403": { "description": "Forbidden" },
-          "404": { "description": "Extension not found" }
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Extension not found"
+          }
         }
       },
       "delete": {
         "summary": "Delete own extension (or any extension if admin)",
-        "tags": ["USERSPACE"],
-        "security": [{ "token": [] }],
+        "tags": [
+          "USERSPACE"
+        ],
+        "security": [
+          {
+            "token": []
+          }
+        ],
         "parameters": [
-          { "$ref": "#/components/parameters/NamespaceParam" },
-          { "$ref": "#/components/parameters/ExtensionIdParam" }
+          {
+            "$ref": "#/components/parameters/NamespaceParam"
+          },
+          {
+            "$ref": "#/components/parameters/ExtensionIdParam"
+          }
         ],
         "responses": {
-          "200": { "description": "Deleted" },
-          "401": { "description": "Unauthorized" },
-          "403": { "description": "Forbidden" },
-          "404": { "description": "Extension not found" }
+          "200": {
+            "description": "Deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Extension not found"
+          }
         }
       }
     },
     "/@{namespace}/{id}/{version}": {
       "get": {
         "summary": "Read extension source by version (or latest)",
-        "tags": ["OPEN"],
+        "tags": [
+          "OPEN"
+        ],
         "parameters": [
-          { "$ref": "#/components/parameters/NamespaceParam" },
-          { "$ref": "#/components/parameters/ExtensionIdParam" },
+          {
+            "$ref": "#/components/parameters/NamespaceParam"
+          },
+          {
+            "$ref": "#/components/parameters/ExtensionIdParam"
+          },
           {
             "name": "version",
             "in": "path",
             "required": true,
             "description": "Semver version or latest",
-            "schema": { "type": "string", "example": "latest" }
+            "schema": {
+              "type": "string",
+              "example": "latest"
+            }
           }
         ],
         "responses": {
           "200": {
             "description": "JavaScript extension source",
             "content": {
-              "application/javascript": { "schema": { "type": "string" } }
+              "application/javascript": {
+                "schema": {
+                  "type": "string"
+                }
+              }
             }
           },
-          "404": { "description": "Extension/version not found" }
+          "404": {
+            "description": "Extension/version not found"
+          }
         }
       }
     },
     "/@{namespace}/{id}/approve": {
       "post": {
         "summary": "Approve pending extension (admin only)",
-        "tags": ["ADMINSPACE"],
-        "security": [{ "token": [] }],
+        "tags": [
+          "ADMINSPACE"
+        ],
+        "security": [
+          {
+            "token": []
+          }
+        ],
         "parameters": [
-          { "$ref": "#/components/parameters/NamespaceParam" },
-          { "$ref": "#/components/parameters/ExtensionIdParam" }
+          {
+            "$ref": "#/components/parameters/NamespaceParam"
+          },
+          {
+            "$ref": "#/components/parameters/ExtensionIdParam"
+          }
         ],
         "responses": {
-          "200": { "description": "Approved" },
-          "401": { "description": "Unauthorized" },
-          "403": { "description": "Admin required" },
-          "404": { "description": "Extension not found" }
+          "200": {
+            "description": "Approved"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Admin required"
+          },
+          "404": {
+            "description": "Extension not found"
+          }
         }
       }
     },
     "/search": {
       "get": {
         "summary": "Search published extensions",
-        "tags": ["OPEN"],
+        "tags": [
+          "OPEN"
+        ],
         "parameters": [
           {
             "name": "query",
             "in": "query",
-            "required": true,
-            "schema": { "type": "string" }
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Free-text match against display name, owner/id, and description. When omitted, returns the most recently published extensions."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -333,18 +546,44 @@
             "description": "Search results",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/SearchResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
               }
             }
           },
-          "400": { "description": "Missing/invalid query" }
+          "400": {
+            "description": "Missing/invalid query"
+          }
         }
       }
     },
-    "/packages": {
+    "/stats": {
       "get": {
-        "summary": "List published packages",
-        "tags": ["OPEN"],
+        "summary": "Registry statistics",
+        "tags": [
+          "OPEN"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/extensions": {
+      "get": {
+        "summary": "List published extensions",
+        "tags": [
+          "OPEN"
+        ],
         "parameters": [
           {
             "name": "limit",
@@ -356,33 +595,27 @@
               "default": 20
             }
           },
-          { "name": "cursor", "in": "query", "schema": { "type": "string" } }
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
         ],
         "responses": {
           "200": {
             "description": "Package list",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/PackagesResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionsResponse"
+                }
               }
             }
           },
-          "400": { "description": "Bad request" }
-        }
-      }
-    },
-    "/stats": {
-      "get": {
-        "summary": "Registry statistics",
-        "tags": ["OPEN"],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/StatsResponse" }
-              }
-            }
+          "400": {
+            "description": "Bad request"
           }
         }
       }
@@ -430,47 +663,83 @@
             "readOnly": true,
             "example": 1
           },
-          "displayName": { "type": "string", "example": "Boswell Fox" },
-          "namespace": { "type": "string", "readOnly": true, "example": "boswellfox" },
+          "displayName": {
+            "type": "string",
+            "example": "Boswell Fox"
+          },
+          "namespace": {
+            "type": "string",
+            "readOnly": true,
+            "example": "boswellfox"
+          },
           "type": {
             "type": "string",
             "readOnly": true,
-            "enum": ["admin", "normal"],
+            "enum": [
+              "admin",
+              "normal"
+            ],
             "example": "normal"
           },
           "extensions": {
             "type": "array",
             "readOnly": true,
-            "items": { "type": "string" }
+            "items": {
+              "type": "string"
+            }
           }
         },
-        "required": ["id", "namespace", "type", "extensions"]
+        "required": [
+          "id",
+          "namespace",
+          "type",
+          "extensions"
+        ]
       },
       "SignupRequest": {
         "type": "object",
         "properties": {
-          "namespace": { "type": "string", "example": "boswellfox" },
-          "displayName": { "type": "string", "example": "Boswell Fox" },
+          "namespace": {
+            "type": "string",
+            "example": "boswellfox"
+          },
+          "displayName": {
+            "type": "string",
+            "example": "Boswell Fox"
+          },
           "password": {
             "type": "string",
             "format": "password",
             "minLength": 8
           }
         },
-        "required": ["namespace", "password"]
+        "required": [
+          "namespace",
+          "password"
+        ]
       },
       "LoginRequest": {
         "type": "object",
         "properties": {
-          "namespace": { "type": "string" },
-          "password": { "type": "string", "format": "password" }
+          "namespace": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string",
+            "format": "password"
+          }
         },
-        "required": ["namespace", "password"]
+        "required": [
+          "namespace",
+          "password"
+        ]
       },
       "UpdateUserRequest": {
         "type": "object",
         "properties": {
-          "displayName": { "type": "string" },
+          "displayName": {
+            "type": "string"
+          },
           "password": {
             "type": "string",
             "format": "password",
@@ -482,22 +751,57 @@
       "AuthResponse": {
         "type": "object",
         "properties": {
-          "user": { "$ref": "#/components/schemas/User" },
-          "token": { "type": "string", "description": "******" }
+          "user": {
+            "$ref": "#/components/schemas/User"
+          },
+          "token": {
+            "type": "string",
+            "description": "******"
+          }
         },
-        "required": ["user", "token"]
+        "required": [
+          "user",
+          "token"
+        ]
       },
       "ExtensionMeta": {
         "type": "object",
         "properties": {
-          "class": { "type": "string", "example": "HelloWorld" },
-          "name": { "type": "string", "example": "It works!" },
-          "id": { "type": "string", "example": "helloworld" },
-          "license": { "type": "string", "example": "Apache-2.0" },
-          "authors": { "type": "array", "items": { "type": "string" } },
-          "originalAuthors": { "type": "array", "items": { "type": "string" } },
-          "description": { "type": "string" },
-          "version": { "type": "string", "example": "0.1.0" }
+          "class": {
+            "type": "string",
+            "example": "HelloWorld"
+          },
+          "name": {
+            "type": "string",
+            "example": "It works!"
+          },
+          "id": {
+            "type": "string",
+            "example": "helloworld"
+          },
+          "license": {
+            "type": "string",
+            "example": "Apache-2.0"
+          },
+          "authors": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "originalAuthors": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "description": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string",
+            "example": "0.1.0"
+          }
         },
         "required": [
           "class",
@@ -512,90 +816,191 @@
       "Extension": {
         "type": "object",
         "properties": {
-          "owner": { "type": "string", "example": "boswellfox" },
-          "id": { "type": "string", "example": "helloworld" },
-          "meta": { "$ref": "#/components/schemas/ExtensionMeta" },
+          "owner": {
+            "type": "string",
+            "example": "boswellfox"
+          },
+          "id": {
+            "type": "string",
+            "example": "helloworld"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ExtensionMeta"
+          },
           "versions": {
             "type": "array",
             "readOnly": true,
-            "items": { "type": "string" }
+            "items": {
+              "type": "string"
+            }
           },
-          "approved": { "type": "boolean", "readOnly": true }
+          "approved": {
+            "type": "boolean",
+            "readOnly": true
+          }
         },
-        "required": ["owner", "id", "meta"]
+        "required": [
+          "owner",
+          "id",
+          "meta"
+        ]
       },
       "PublishExtensionRequest": {
         "type": "object",
         "properties": {
-          "id": { "type": "string", "example": "helloworld" },
-          "meta": { "$ref": "#/components/schemas/ExtensionMeta" },
+          "id": {
+            "type": "string",
+            "example": "helloworld"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ExtensionMeta"
+          },
           "extensionBlob": {
             "type": "string",
             "writeOnly": true,
             "description": "JavaScript extension source code"
           }
         },
-        "required": ["id", "meta", "extensionBlob"]
+        "required": [
+          "id",
+          "meta",
+          "extensionBlob"
+        ]
       },
       "UpdateExtensionRequest": {
         "type": "object",
         "properties": {
-          "meta": { "$ref": "#/components/schemas/ExtensionMeta" },
-          "extensionBlob": { "type": "string", "writeOnly": true }
+          "meta": {
+            "$ref": "#/components/schemas/ExtensionMeta"
+          },
+          "extensionBlob": {
+            "type": "string",
+            "writeOnly": true
+          }
         },
         "minProperties": 1
       },
       "PublishedExtension": {
         "type": "object",
         "properties": {
-          "extension": { "$ref": "#/components/schemas/Extension" },
+          "extension": {
+            "$ref": "#/components/schemas/Extension"
+          },
           "publishedUrl": {
             "type": "string",
             "example": "/v2/@boswellfox/helloworld"
           }
         },
-        "required": ["extension", "publishedUrl"]
+        "required": [
+          "extension",
+          "publishedUrl"
+        ]
       },
       "UsersResponse": {
         "type": "object",
         "properties": {
           "users": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/User" }
+            "items": {
+              "$ref": "#/components/schemas/User"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
           }
         },
-        "required": ["users"]
+        "required": [
+          "users",
+          "nextCursor"
+        ]
       },
       "SearchResult": {
         "type": "object",
         "properties": {
-          "owner": { "type": "string" },
-          "id": { "type": "string" },
-          "name": { "type": "string" },
-          "description": { "type": "string" },
-          "latestVersion": { "type": "string" }
+          "owner": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "latestVersion": {
+            "type": "string"
+          }
         },
-        "required": ["owner", "id", "name", "latestVersion"]
+        "required": [
+          "owner",
+          "id",
+          "name",
+          "latestVersion"
+        ]
       },
       "SearchResponse": {
         "type": "object",
         "properties": {
           "results": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/SearchResult" }
+            "items": {
+              "$ref": "#/components/schemas/SearchResult"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
           }
         },
-        "required": ["results"]
+        "required": [
+          "results",
+          "nextCursor"
+        ]
       },
-      "PackageSummary": {
+      "StatsResponse": {
         "type": "object",
         "properties": {
-          "owner": { "type": "string" },
-          "id": { "type": "string" },
-          "name": { "type": "string" },
-          "description": { "type": "string" },
-          "latestVersion": { "type": "string" },
-          "publishedAt": { "type": "string", "format": "date-time" }
+          "published": {
+            "type": "integer"
+          },
+          "pending": {
+            "type": "integer"
+          },
+          "authors": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "published",
+          "pending",
+          "authors"
+        ]
+      },
+      "ExtensionSummary": {
+        "type": "object",
+        "properties": {
+          "owner": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "latestVersion": {
+            "type": "string"
+          },
+          "publishedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
         },
         "required": [
           "owner",
@@ -605,25 +1010,24 @@
           "publishedAt"
         ]
       },
-      "PackagesResponse": {
+      "ExtensionsResponse": {
         "type": "object",
         "properties": {
-          "packages": {
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/PackageSummary" }
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
           },
-          "nextCursor": { "type": "string", "nullable": true }
+          "extensions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExtensionSummary"
+            }
+          }
         },
-        "required": ["packages", "nextCursor"]
-      },
-      "StatsResponse": {
-        "type": "object",
-        "properties": {
-          "published": { "type": "integer" },
-          "pending": { "type": "integer" },
-          "authors": { "type": "integer" }
-        },
-        "required": ["published", "pending", "authors"]
+        "required": [
+          "extensions",
+          "nextCursor"
+        ]
       }
     }
   },

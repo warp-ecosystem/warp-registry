@@ -34,8 +34,8 @@ The HTTP API is versioned and documented by OpenAPI. The authoritative contract 
 | DELETE | `/v2/@{namespace}/{id}`           | ✓     | Delete own extension                                 |
 | GET    | `/v2/@{namespace}/{id}/{version}` | —     | Fetch extension source (`latest` resolves to newest) |
 | POST   | `/v2/@{namespace}/{id}/approve`   | admin | Approve a pending extension                          |
-| GET    | `/v2/search?query=...`            | —     | Search published extensions                          |
-| GET    | `/v2/packages`                    | —     | List published packages                              |
+| GET    | `/v2/search?query=...`            | —     | Search published extensions (query optional)         |
+| GET    | `/v2/extensions`                  | —     | List published extensions                            |
 | GET    | `/v2/stats`                       | —     | Registry statistics                                  |
 
 Authentication uses the `Authorization: Bearer <token>` header. Missing or invalid tokens return `401`; authenticated-but-unauthorized access returns `403`.

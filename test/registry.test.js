@@ -571,7 +571,7 @@ describe("warp-registry v2 publish flow", () => {
     assert.doesNotMatch(rejectedBody.error, /awaiting review/i);
   });
 
-  test("concurrent publishes for the same unapproved owner with different versions yield one 201 and one 409", async () => {
+  test("concurrent publishes for the same unapproved owner with different versions yield one 201 and one 403", async () => {
     const token = await insertOwner(db, "concurrentdiffowner");
 
     const [a, b] = await Promise.all([
@@ -580,9 +580,9 @@ describe("warp-registry v2 publish flow", () => {
     ]);
 
     const statuses = [a.status, b.status].sort();
-    assert.deepEqual(statuses, [201, 409]);
+    assert.deepEqual(statuses, [201, 403]);
 
-    const rejected = a.status === 409 ? a : b;
+    const rejected = a.status === 403 ? a : b;
     const rejectedBody = await rejected.json();
     assert.match(rejectedBody.error, /already awaiting review/i);
 
@@ -742,7 +742,7 @@ describe("warp-registry v2 publish flow", () => {
     assert.equal(bodyA.extension.approved, false);
 
     const b = await publishForVersion(base, token, "0.2.0");
-    assert.equal(b.status, 409);
+    assert.equal(b.status, 403);
     const bodyB = await b.json();
     assert.match(bodyB.error, /already awaiting review/i);
 
@@ -1024,15 +1024,41 @@ describe("warp-registry v2 search endpoint", () => {
     db.close();
   });
 
-  test("empty or missing q returns 400", async () => {
-    const missing = await fetch(`${base}/v2/search`);
-    assert.equal(missing.status, 400);
+  test("missing or blank query returns the most recently published extensions", async () => {
+    for (const url of [
+      `${base}/v2/search`,
+      `${base}/v2/search?query=`,
+      `${base}/v2/search?query=%20%20`,
+    ]) {
+      const res = await fetch(url);
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.ok(Array.isArray(body.results));
+      assert.ok(
+        body.results.length >= 8,
+        "recent published extensions are returned",
+      );
+      const ids = body.results.map((r) => r.id);
+      assert.ok(ids.includes("namesearch"));
+      assert.ok(ids.includes("longspkg"));
+      assert.ok(!ids.includes("pkgpending"), "pending extensions are excluded");
+      assert.ok("nextCursor" in body, "response includes nextCursor");
+    }
 
-    const empty = await fetch(`${base}/v2/search?query=`);
-    assert.equal(empty.status, 400);
+    const searchRes = await fetch(`${base}/v2/search`);
+    assert.equal(searchRes.status, 200);
+    const searchIds = (await searchRes.json()).results.map((r) => r.id);
 
-    const blank = await fetch(`${base}/v2/search?query=%20%20`);
-    assert.equal(blank.status, 400);
+    const extensionsRes = await fetch(`${base}/v2/extensions?limit=50`);
+    const extensionsBody = await extensionsRes.json();
+    const extensionsIds = extensionsBody.extensions
+      .slice(0, searchIds.length)
+      .map((p) => p.id);
+    assert.deepEqual(
+      searchIds,
+      extensionsIds,
+      "omitted query uses the same ordering as /extensions",
+    );
   });
 
   test("search matches on display name (case-insensitive)", async () => {
@@ -1193,6 +1219,92 @@ describe("warp-registry v2 search endpoint", () => {
   });
 });
 
+describe("warp-registry v2 search pagination", () => {
+  let server;
+  let db;
+  let base;
+
+  before(async () => {
+    ({ server, db, base } = await startServer());
+
+    const setCreatedAt = (owner, id, createdAt) => {
+      db.prepare(
+        `UPDATE versions SET created_at = ?
+         WHERE owner_id = (SELECT id FROM users WHERE namespace = ?)
+           AND package_id = ?`,
+      ).run(createdAt, owner, id);
+    };
+
+    for (let i = 1; i <= 12; i += 1) {
+      const owner = `spg${String(i).padStart(2, "0")}`;
+      const token = await insertApprovedOwner(db, owner);
+      const id = `spkg${String(i).padStart(2, "0")}`;
+      await publish(
+        base,
+        token,
+        buildPublishBody({ id, name: `Search Pkg ${i}` }),
+      );
+      setCreatedAt(owner, id, `2024-03-${String(i).padStart(2, "0")} 10:00:00`);
+    }
+  });
+
+  after(async () => {
+    await closeServer(server);
+    db.close();
+  });
+
+  test("omitted query paginates recent results with nextCursor", async () => {
+    const page1Res = await fetch(`${base}/v2/search`);
+    assert.equal(page1Res.status, 200);
+    const page1 = await page1Res.json();
+    assert.deepEqual(
+      page1.results.map((r) => r.id),
+      Array.from(
+        { length: 10 },
+        (_, i) => `spkg${String(12 - i).padStart(2, "0")}`,
+      ),
+    );
+    assert.ok(page1.nextCursor, "first page must have a nextCursor");
+
+    const page2Res = await fetch(
+      `${base}/v2/search?cursor=${encodeURIComponent(page1.nextCursor)}`,
+    );
+    assert.equal(page2Res.status, 200);
+    const page2 = await page2Res.json();
+    assert.deepEqual(
+      page2.results.map((r) => r.id),
+      ["spkg02", "spkg01"],
+    );
+    assert.equal(page2.nextCursor, null, "last page must have null nextCursor");
+  });
+
+  test("filtered search paginates with nextCursor too", async () => {
+    const page1Res = await fetch(`${base}/v2/search?query=Search%20Pkg`);
+    assert.equal(page1Res.status, 200);
+    const page1 = await page1Res.json();
+    assert.equal(page1.results.length, 10);
+    assert.ok(page1.nextCursor, "first page must have a nextCursor");
+
+    const page2Res = await fetch(
+      `${base}/v2/search?query=Search%20Pkg&cursor=${encodeURIComponent(page1.nextCursor)}`,
+    );
+    assert.equal(page2Res.status, 200);
+    const page2 = await page2Res.json();
+    assert.equal(page2.results.length, 2);
+    assert.equal(page2.nextCursor, null, "last page must have null nextCursor");
+  });
+
+  test("invalid cursor returns 400", async () => {
+    const notBase64 = await fetch(`${base}/v2/search?cursor=not-a-cursor`);
+    assert.equal(notBase64.status, 400);
+
+    const badJson = await fetch(
+      `${base}/v2/search?cursor=${encodeURIComponent(Buffer.from("not json").toString("base64"))}`,
+    );
+    assert.equal(badJson.status, 400);
+  });
+});
+
 describe("warp-registry v2 semver precedence in discovery routes", () => {
   let server;
   let db;
@@ -1265,7 +1377,7 @@ describe("warp-registry v2 semver precedence in discovery routes", () => {
     db.close();
   });
 
-  async function latestFromSearchAndPackages(pkgId) {
+  async function latestFromSearchAndExtensions(pkgId) {
     const searchRes = await fetch(
       `${base}/v2/search?query=${encodeURIComponent(pkgId)}`,
     );
@@ -1273,21 +1385,23 @@ describe("warp-registry v2 semver precedence in discovery routes", () => {
     const searchBody = await searchRes.json();
     const searchMatch = searchBody.results.find((r) => r.id === pkgId);
 
-    const packagesRes = await fetch(`${base}/v2/packages?limit=50`);
-    assert.equal(packagesRes.status, 200);
-    const packagesBody = await packagesRes.json();
-    const packagesMatch = packagesBody.packages.find((p) => p.id === pkgId);
+    const extensionsRes = await fetch(`${base}/v2/extensions?limit=50`);
+    assert.equal(extensionsRes.status, 200);
+    const extensionsBody = await extensionsRes.json();
+    const extensionsMatch = extensionsBody.extensions.find(
+      (p) => p.id === pkgId,
+    );
 
-    return { searchMatch, packagesMatch };
+    return { searchMatch, extensionsMatch };
   }
 
   async function assertLatest(pkgId, expected) {
-    const { searchMatch, packagesMatch } =
-      await latestFromSearchAndPackages(pkgId);
+    const { searchMatch, extensionsMatch } =
+      await latestFromSearchAndExtensions(pkgId);
     assert.ok(searchMatch, `search must return ${pkgId}`);
     assert.equal(searchMatch.latestVersion, expected);
-    assert.ok(packagesMatch, `packages must return ${pkgId}`);
-    assert.equal(packagesMatch.latestVersion, expected);
+    assert.ok(extensionsMatch, `extensions must return ${pkgId}`);
+    assert.equal(extensionsMatch.latestVersion, expected);
   }
 
   test("a normal release beats an identical-core prerelease regardless of created_at", async () => {
@@ -1374,7 +1488,7 @@ describe("warp-registry v2 search LIKE escaping", () => {
   });
 });
 
-describe("warp-registry v2 packages pagination", () => {
+describe("warp-registry v2 extensions pagination", () => {
   let server;
   let db;
   let base;
@@ -1421,31 +1535,31 @@ describe("warp-registry v2 packages pagination", () => {
   });
 
   test("returns results in recency order and paginates with nextCursor", async () => {
-    const page1Res = await fetch(`${base}/v2/packages?limit=2`);
+    const page1Res = await fetch(`${base}/v2/extensions?limit=2`);
     assert.equal(page1Res.status, 200);
     const page1 = await page1Res.json();
     assert.deepEqual(
-      page1.packages.map((p) => p.id),
+      page1.extensions.map((p) => p.id),
       ["ccc", "bbb"],
     );
     assert.ok(page1.nextCursor, "first page must have a nextCursor");
 
     const page2Res = await fetch(
-      `${base}/v2/packages?limit=2&cursor=${encodeURIComponent(page1.nextCursor)}`,
+      `${base}/v2/extensions?limit=2&cursor=${encodeURIComponent(page1.nextCursor)}`,
     );
     assert.equal(page2Res.status, 200);
     const page2 = await page2Res.json();
     assert.deepEqual(
-      page2.packages.map((p) => p.id),
+      page2.extensions.map((p) => p.id),
       ["aaa"],
     );
     assert.equal(page2.nextCursor, null, "last page must have null nextCursor");
   });
 
   test("response shape includes owner, id, name, description, latestVersion, publishedAt", async () => {
-    const res = await fetch(`${base}/v2/packages?limit=1`);
+    const res = await fetch(`${base}/v2/extensions?limit=1`);
     const body = await res.json();
-    const pkg = body.packages[0];
+    const pkg = body.extensions[0];
     assert.deepEqual(Object.keys(pkg).sort(), [
       "description",
       "id",
@@ -1461,7 +1575,7 @@ describe("warp-registry v2 packages pagination", () => {
   });
 });
 
-describe("warp-registry v2 packages pagination: limit and cursor validation", () => {
+describe("warp-registry v2 extensions pagination: limit and cursor validation", () => {
   let server;
   let db;
   let base;
@@ -1482,33 +1596,33 @@ describe("warp-registry v2 packages pagination: limit and cursor validation", ()
   });
 
   test("limit above 50 is clamped to 50", async () => {
-    const res = await fetch(`${base}/v2/packages?limit=100`);
+    const res = await fetch(`${base}/v2/extensions?limit=100`);
     assert.equal(res.status, 200);
     const body = await res.json();
-    assert.equal(body.packages.length, 50);
+    assert.equal(body.extensions.length, 50);
     assert.ok(body.nextCursor, "a nextCursor should remain after clamping");
   });
 
   test("non-positive or non-integer limit returns 400", async () => {
-    const zero = await fetch(`${base}/v2/packages?limit=0`);
+    const zero = await fetch(`${base}/v2/extensions?limit=0`);
     assert.equal(zero.status, 400);
 
-    const negative = await fetch(`${base}/v2/packages?limit=-5`);
+    const negative = await fetch(`${base}/v2/extensions?limit=-5`);
     assert.equal(negative.status, 400);
 
-    const nonInteger = await fetch(`${base}/v2/packages?limit=2.5`);
+    const nonInteger = await fetch(`${base}/v2/extensions?limit=2.5`);
     assert.equal(nonInteger.status, 400);
 
-    const notANumber = await fetch(`${base}/v2/packages?limit=abc`);
+    const notANumber = await fetch(`${base}/v2/extensions?limit=abc`);
     assert.equal(notANumber.status, 400);
   });
 
   test("invalid cursor returns 400", async () => {
-    const notBase64 = await fetch(`${base}/v2/packages?cursor=not-a-cursor`);
+    const notBase64 = await fetch(`${base}/v2/extensions?cursor=not-a-cursor`);
     assert.equal(notBase64.status, 400);
 
     const badJson = await fetch(
-      `${base}/v2/packages?cursor=${encodeURIComponent(Buffer.from("not json").toString("base64"))}`,
+      `${base}/v2/extensions?cursor=${encodeURIComponent(Buffer.from("not json").toString("base64"))}`,
     );
     assert.equal(badJson.status, 400);
   });
@@ -1595,7 +1709,7 @@ describe("warp-registry v2 second pending publish guard", () => {
       token,
       buildPublishBody({ id: "pkgb", version: "0.1.0" }),
     );
-    assert.equal(bRes.status, 409);
+    assert.equal(bRes.status, 403);
     const bBody = await bRes.json();
     assert.match(bBody.error, /already awaiting review/i);
 
@@ -1652,6 +1766,39 @@ describe("warp-registry v2 users endpoint", () => {
     assert.ok(Array.isArray(body.users));
     assert.ok(body.users.length >= 2);
     assert.ok(body.users[0].namespace);
+    assert.equal(body.nextCursor, null);
+  });
+
+  test("GET /v2/users paginates with a cursor", async () => {
+    for (let i = 0; i < 5; i += 1) {
+      await insertOwner(db, `cursuser${i}`);
+    }
+
+    const seen = [];
+    let cursor = "";
+    let page;
+    do {
+      const url = cursor
+        ? `${base}/v2/users?limit=2&cursor=${encodeURIComponent(cursor)}`
+        : `${base}/v2/users?limit=2`;
+      const res = await fetch(url);
+      assert.equal(res.status, 200);
+      page = await res.json();
+      assert.ok(Array.isArray(page.users));
+      assert.ok(page.users.length <= 2);
+      for (const u of page.users) seen.push(u.namespace);
+      cursor = page.nextCursor;
+    } while (cursor);
+
+    const unique = new Set(seen);
+    assert.equal(
+      unique.size,
+      seen.length,
+      "no user appears twice across pages",
+    );
+    assert.equal(seen.includes("user1"), true);
+    assert.equal(seen.includes("cursuser0"), true);
+    assert.equal(seen.includes("cursuser4"), true);
   });
 
   test("GET /v2/users/:namespace returns a single user", async () => {
