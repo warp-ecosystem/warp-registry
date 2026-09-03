@@ -25,6 +25,7 @@
     "better-sqlite3": "^13.0.3",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.7.0",
     "picocolors": "^1.1.1",
     "semver": "^7.6.2"
   },
