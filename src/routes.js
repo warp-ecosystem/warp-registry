@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import express from "express";
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import semver from "semver";
 import { NAMESPACE_RE, blobPath, blobsDir } from "./db.js";
 import { extractWarpMeta } from "./warp-meta.js";
@@ -139,37 +139,6 @@ function createSignupLimiter() {
       } else {
         buckets.set(key, { count: 1, reserved: 0, firstAt: now });
       }
-    },
-  };
-}
-
-/**
- * General-purpose per-key rate limiter that counts requests (both successful
- * and failed). Unlike {@link createRateLimiter} which only tracks failures,
- * this counts every request so it can be used for read-heavy or mutating
- * endpoints where any volume of requests is the concern.
- * @param {number} [maxRequests] - Max requests allowed in the window.
- * @returns {{ isLimited: (key: string, now?: number) => boolean }}
- */
-function createRequestRateLimiter(maxRequests = REQUEST_RATE_LIMIT_MAX) {
-  const buckets = new Map();
-  function sweep(now = Date.now()) {
-    for (const [key, entry] of buckets) {
-      if (now - entry.firstAt > REQUEST_RATE_LIMIT_WINDOW_MS) {
-        buckets.delete(key);
-      }
-    }
-  }
-  return {
-    isLimited(key, now = Date.now()) {
-      sweep(now);
-      const entry = buckets.get(key);
-      if (!entry) {
-        buckets.set(key, { count: 1, firstAt: now });
-        return false;
-      }
-      entry.count += 1;
-      return entry.count > maxRequests;
     },
   };
 }
@@ -518,24 +487,6 @@ export function createApp({ db, dataDir }) {
 
   const rateLimiter = createRateLimiter();
   const signupLimiter = createSignupLimiter();
-  const signupRequestLimiter = createRequestRateLimiter();
-  const loginRequestLimiter = createRequestRateLimiter();
-
-  // Per-route request rate limiters (different limits by endpoint type)
-  const logoutLimiter = createRequestRateLimiter();
-  const usersListLimiter = createRequestRateLimiter();
-  const userDetailLimiter = createRequestRateLimiter();
-  const userPatchLimiter = createRequestRateLimiter();
-  const userDeleteLimiter = createRequestRateLimiter();
-  const publishLimiter = createRequestRateLimiter();
-  const extensionInfoLimiter = createRequestRateLimiter();
-  const extensionPatchLimiter = createRequestRateLimiter();
-  const extensionDeleteLimiter = createRequestRateLimiter();
-  const versionBlobLimiter = createRequestRateLimiter();
-  const approveLimiter = createRequestRateLimiter();
-  const searchLimiter = createRequestRateLimiter();
-  const extensionsListLimiter = createRequestRateLimiter();
-  const statsLimiter = createRequestRateLimiter();
 
   const rateLimited = (res) => {
     res.status(429).json({ error: "Too many attempts. Try again later." });
@@ -544,16 +495,15 @@ export function createApp({ db, dataDir }) {
   const clientIp = (req) =>
     req.ip || (req.socket && req.socket.remoteAddress) || "unknown";
 
-  const routeLimiter = (keyFn) =>
-    rateLimit({
-      keyGenerator: keyFn,
-      max: REQUEST_RATE_LIMIT_MAX,
-      windowMs: REQUEST_RATE_LIMIT_WINDOW_MS,
-      handler: (req, res) =>
-        res.status(429).json({ error: "Too many attempts. Try again later." }),
-      standardHeaders: false,
-      legacyHeaders: false,
-    });
+  const routeLimiter = rateLimit({
+    keyGenerator: (req) => ipKeyGenerator(clientIp(req)),
+    limit: REQUEST_RATE_LIMIT_MAX,
+    windowMs: REQUEST_RATE_LIMIT_WINDOW_MS,
+    handler: (req, res) =>
+      res.status(429).json({ error: "Too many attempts. Try again later." }),
+    standardHeaders: false,
+    legacyHeaders: false,
+  });
 
   const blobsBase = blobsDir(dataDir);
 
@@ -582,525 +532,475 @@ export function createApp({ db, dataDir }) {
     return { ok: true, blobPath: resolved };
   }
 
-  app.post(
-    "/v2/auth/signup",
-    routeLimiter((req) => `signup:${clientIp(req)}`),
-    async (req, res) => {
-      const { namespace, displayName, password } = req.body || {};
-      const rateKey = `signup:${clientIp(req)}`;
-      const reject = (status, error) => {
-        if (rateLimiter.onFailure(rateKey)) {
-          rateLimited(res);
-          return;
-        }
-        res.status(status).json({ error });
-      };
-
-      if (!namespace || typeof namespace !== "string") {
-        reject(400, "namespace is required.");
-        return;
-      }
-      if (!NAMESPACE_RE.test(namespace)) {
-        reject(
-          400,
-          "namespace must match ^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$.",
-        );
-        return;
-      }
-      if (!password || typeof password !== "string" || password.length < 8) {
-        reject(400, "password must be at least 8 characters.");
-        return;
-      }
-      if (displayName !== undefined && typeof displayName !== "string") {
-        reject(400, "displayName must be a string.");
-        return;
-      }
-
-      if (signupLimiter.isLimited(rateKey)) {
-        rateLimited(res);
-        return;
-      }
-      if (!signupLimiter.reserve(rateKey)) {
-        rateLimited(res);
-        return;
-      }
-      if (signupRequestLimiter.isLimited(clientIp(req))) {
-        rateLimited(res);
-        return;
-      }
-
-      const existing = db
-        .prepare("SELECT id FROM users WHERE namespace = ?")
-        .get(namespace);
-      if (existing) {
-        signupLimiter.release(rateKey);
-        reject(409, "Namespace already exists.");
-        return;
-      }
-
-      const passwordHash = await hashPassword(password);
-
-      let result;
-      try {
-        result = db
-          .prepare(
-            `INSERT INTO users (namespace, display_name, password_hash, type)
-           VALUES (?, ?, ?, 'normal')`,
-          )
-          .run(namespace, displayName || "", passwordHash);
-      } catch (err) {
-        signupLimiter.release(rateKey);
-        if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
-          reject(409, "Namespace already exists.");
-          return;
-        }
-        throw err;
-      }
-
-      signupLimiter.recordSuccess(rateKey);
-
-      const user = db
-        .prepare("SELECT * FROM users WHERE id = ?")
-        .get(result.lastInsertRowid);
-
-      const token = crypto.randomBytes(32).toString("hex");
-      const tokenHash = hashToken(token);
-      const expiresAt = new Date(Date.now() + TOKEN_TTL_MS).toISOString();
-      db.prepare(
-        "INSERT INTO auth_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
-      ).run(user.id, tokenHash, expiresAt);
-
-      success(`User signed up: ${namespace}`);
-      res.status(201).json({ user: userResponse(user, db), token });
-    },
-  );
-
-  app.post(
-    "/v2/auth/login",
-    routeLimiter((req) => {
-      const ns =
-        typeof (req.body || {}).namespace === "string"
-          ? (req.body || {}).namespace
-          : "";
-      return `login:${ns}|${clientIp(req)}`;
-    }),
-    async (req, res) => {
-      const { namespace, password } = req.body || {};
-      if (!namespace || typeof namespace !== "string") {
-        res.status(400).json({ error: "namespace is required." });
-        return;
-      }
-      if (!password || typeof password !== "string") {
-        res.status(400).json({ error: "password is required." });
-        return;
-      }
-
-      const rateKey = `login:${namespace}|${clientIp(req)}`;
+  app.post("/v2/auth/signup", routeLimiter, async (req, res) => {
+    const { namespace, displayName, password } = req.body || {};
+    const rateKey = `signup:${clientIp(req)}`;
+    const reject = (status, error) => {
       if (rateLimiter.onFailure(rateKey)) {
         rateLimited(res);
         return;
       }
+      res.status(status).json({ error });
+    };
 
-      if (loginRequestLimiter.isLimited(clientIp(req))) {
-        rateLimited(res);
-        return;
-      }
-
-      const user = db
-        .prepare("SELECT * FROM users WHERE namespace = ?")
-        .get(namespace);
-      const ok = user && (await verifyPassword(password, user.password_hash));
-      if (!user || !ok) {
-        res.status(401).json({ error: "Invalid credentials." });
-        return;
-      }
-      rateLimiter.onSuccess(rateKey);
-
-      const token = crypto.randomBytes(32).toString("hex");
-      const tokenHash = hashToken(token);
-      const expiresAt = new Date(Date.now() + TOKEN_TTL_MS).toISOString();
-      db.prepare(
-        "INSERT INTO auth_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
-      ).run(user.id, tokenHash, expiresAt);
-
-      success(`User logged in: ${namespace}`);
-      res.status(200).json({ user: userResponse(user, db), token });
-    },
-  );
-
-  app.post(
-    "/v2/auth/logout",
-    routeLimiter((req) => `logout:${clientIp(req)}`),
-    (req, res) => {
-      const auth = authenticate(db, req.headers.authorization);
-      if (!auth) {
-        res.status(401).json({ error: "Unauthorized." });
-        return;
-      }
-      if (logoutLimiter.isLimited(`${auth.user.namespace}|${clientIp(req)}`)) {
-        rateLimited(res);
-        return;
-      }
-      db.prepare("DELETE FROM auth_tokens WHERE token_hash = ?").run(
-        auth.tokenHash,
+    if (!namespace || typeof namespace !== "string") {
+      reject(400, "namespace is required.");
+      return;
+    }
+    if (!NAMESPACE_RE.test(namespace)) {
+      reject(
+        400,
+        "namespace must match ^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$.",
       );
-      res.status(200).json({ message: "Logged out." });
-    },
-  );
+      return;
+    }
+    if (!password || typeof password !== "string" || password.length < 8) {
+      reject(400, "password must be at least 8 characters.");
+      return;
+    }
+    if (displayName !== undefined && typeof displayName !== "string") {
+      reject(400, "displayName must be a string.");
+      return;
+    }
+
+    if (signupLimiter.isLimited(rateKey)) {
+      rateLimited(res);
+      return;
+    }
+    if (!signupLimiter.reserve(rateKey)) {
+      rateLimited(res);
+      return;
+    }
+
+    const existing = db
+      .prepare("SELECT id FROM users WHERE namespace = ?")
+      .get(namespace);
+    if (existing) {
+      signupLimiter.release(rateKey);
+      reject(409, "Namespace already exists.");
+      return;
+    }
+
+    const passwordHash = await hashPassword(password);
+
+    let result;
+    try {
+      result = db
+        .prepare(
+          `INSERT INTO users (namespace, display_name, password_hash, type)
+           VALUES (?, ?, ?, 'normal')`,
+        )
+        .run(namespace, displayName || "", passwordHash);
+    } catch (err) {
+      signupLimiter.release(rateKey);
+      if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
+        reject(409, "Namespace already exists.");
+        return;
+      }
+      throw err;
+    }
+
+    signupLimiter.recordSuccess(rateKey);
+
+    const user = db
+      .prepare("SELECT * FROM users WHERE id = ?")
+      .get(result.lastInsertRowid);
+
+    const token = crypto.randomBytes(32).toString("hex");
+    const tokenHash = hashToken(token);
+    const expiresAt = new Date(Date.now() + TOKEN_TTL_MS).toISOString();
+    db.prepare(
+      "INSERT INTO auth_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+    ).run(user.id, tokenHash, expiresAt);
+
+    success(`User signed up: ${namespace}`);
+    res.status(201).json({ user: userResponse(user, db), token });
+  });
+
+  app.post("/v2/auth/login", routeLimiter, async (req, res) => {
+    const { namespace, password } = req.body || {};
+    if (!namespace || typeof namespace !== "string") {
+      res.status(400).json({ error: "namespace is required." });
+      return;
+    }
+    if (!password || typeof password !== "string") {
+      res.status(400).json({ error: "password is required." });
+      return;
+    }
+
+    const rateKey = `login:${namespace}|${clientIp(req)}`;
+    if (rateLimiter.onFailure(rateKey)) {
+      rateLimited(res);
+      return;
+    }
+
+    const user = db
+      .prepare("SELECT * FROM users WHERE namespace = ?")
+      .get(namespace);
+    const ok = user && (await verifyPassword(password, user.password_hash));
+    if (!user || !ok) {
+      res.status(401).json({ error: "Invalid credentials." });
+      return;
+    }
+    rateLimiter.onSuccess(rateKey);
+
+    const token = crypto.randomBytes(32).toString("hex");
+    const tokenHash = hashToken(token);
+    const expiresAt = new Date(Date.now() + TOKEN_TTL_MS).toISOString();
+    db.prepare(
+      "INSERT INTO auth_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+    ).run(user.id, tokenHash, expiresAt);
+
+    success(`User logged in: ${namespace}`);
+    res.status(200).json({ user: userResponse(user, db), token });
+  });
+
+  app.post("/v2/auth/logout", routeLimiter, (req, res) => {
+    const auth = authenticate(db, req.headers.authorization);
+    if (!auth) {
+      res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
+    db.prepare("DELETE FROM auth_tokens WHERE token_hash = ?").run(
+      auth.tokenHash,
+    );
+    res.status(200).json({ message: "Logged out." });
+  });
 
   // ── User routes ──────────────────────────────────────────────────────
 
-  app.get(
-    "/v2/users",
-    routeLimiter((req) => clientIp(req)),
-    (req, res) => {
-      if (usersListLimiter.isLimited(clientIp(req))) {
-        rateLimited(res);
+  app.get("/v2/users", routeLimiter, (req, res) => {
+    let limit = 20;
+    if (req.query.limit !== undefined) {
+      const parsed = Number(req.query.limit);
+      if (!Number.isInteger(parsed) || parsed < 1) {
+        res.status(400).json({ error: "limit must be a positive integer." });
         return;
       }
+      limit = parsed;
+    }
+    limit = Math.min(limit, 50);
 
-      let limit = 20;
-      if (req.query.limit !== undefined) {
-        const parsed = Number(req.query.limit);
-        if (!Number.isInteger(parsed) || parsed < 1) {
-          res.status(400).json({ error: "limit must be a positive integer." });
-          return;
-        }
-        limit = parsed;
-      }
-      limit = Math.min(limit, 50);
+    const cursor = decodeCursor(
+      req.query.cursor,
+      (d) => typeof d.id === "number",
+    );
+    if (!cursor.ok) {
+      res.status(400).json({ error: "Invalid cursor." });
+      return;
+    }
+    const cursorId = cursor.value ? cursor.value.id : null;
 
-      const cursor = decodeCursor(
-        req.query.cursor,
-        (d) => typeof d.id === "number",
+    const where = cursorId !== null ? "WHERE id > ?" : "";
+    const params = cursorId !== null ? [cursorId] : [];
+
+    const rows = db
+      .prepare(`SELECT * FROM users ${where} ORDER BY id ASC LIMIT ?`)
+      .all(...params, limit + 1);
+
+    const hasMore = rows.length > limit;
+    const page = rows.slice(0, limit);
+
+    let nextCursor = null;
+    if (hasMore) {
+      nextCursor = Buffer.from(
+        JSON.stringify({ id: page[page.length - 1].id }),
+      ).toString("base64");
+    }
+
+    res.json({
+      users: page.map((r) => userResponse(r, db)),
+      nextCursor,
+    });
+  });
+
+  app.get("/v2/users/:namespace", routeLimiter, (req, res) => {
+    const user = db
+      .prepare("SELECT * FROM users WHERE namespace = ?")
+      .get(req.params.namespace);
+    if (!user) {
+      res.status(404).json({ error: "User not found." });
+      return;
+    }
+    res.json(userResponse(user, db));
+  });
+
+  app.patch("/v2/users/:namespace", routeLimiter, async (req, res) => {
+    const auth = authenticate(db, req.headers.authorization);
+    if (!auth) {
+      res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
+    const target = db
+      .prepare("SELECT * FROM users WHERE namespace = ?")
+      .get(req.params.namespace);
+    if (!target) {
+      res.status(404).json({ error: "User not found." });
+      return;
+    }
+    if (auth.user.type !== "admin" && auth.user.id !== target.id) {
+      res.status(403).json({ error: "Forbidden." });
+      return;
+    }
+
+    const { displayName, password } = req.body || {};
+    if (displayName === undefined && password === undefined) {
+      res.status(400).json({ error: "At least one field is required." });
+      return;
+    }
+
+    if (displayName !== undefined && typeof displayName !== "string") {
+      res.status(400).json({ error: "displayName must be a string." });
+      return;
+    }
+    if (
+      password !== undefined &&
+      (typeof password !== "string" || password.length < 8)
+    ) {
+      res.status(400).json({
+        error: "password must be at least 8 characters.",
+      });
+      return;
+    }
+
+    if (displayName !== undefined) {
+      db.prepare("UPDATE users SET display_name = ? WHERE id = ?").run(
+        displayName,
+        target.id,
       );
-      if (!cursor.ok) {
-        res.status(400).json({ error: "Invalid cursor." });
-        return;
-      }
-      const cursorId = cursor.value ? cursor.value.id : null;
+    }
+    if (password !== undefined) {
+      const passwordHash = await hashPassword(password);
+      db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(
+        passwordHash,
+        target.id,
+      );
+      db.prepare("DELETE FROM auth_tokens WHERE user_id = ?").run(target.id);
+    }
 
-      const where = cursorId !== null ? "WHERE id > ?" : "";
-      const params = cursorId !== null ? [cursorId] : [];
+    const updated = db
+      .prepare("SELECT * FROM users WHERE id = ?")
+      .get(target.id);
+    res.json(userResponse(updated, db));
+  });
 
-      const rows = db
-        .prepare(`SELECT * FROM users ${where} ORDER BY id ASC LIMIT ?`)
-        .all(...params, limit + 1);
+  app.delete("/v2/users/:namespace", routeLimiter, (req, res) => {
+    const auth = authenticate(db, req.headers.authorization);
+    if (!auth) {
+      res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
+    const target = db
+      .prepare("SELECT * FROM users WHERE namespace = ?")
+      .get(req.params.namespace);
+    if (!target) {
+      res.status(404).json({ error: "User not found." });
+      return;
+    }
+    if (auth.user.type !== "admin" && auth.user.id !== target.id) {
+      res.status(403).json({ error: "Forbidden." });
+      return;
+    }
 
-      const hasMore = rows.length > limit;
-      const page = rows.slice(0, limit);
-
-      let nextCursor = null;
-      if (hasMore) {
-        nextCursor = Buffer.from(
-          JSON.stringify({ id: page[page.length - 1].id }),
-        ).toString("base64");
-      }
-
-      res.json({
-        users: page.map((r) => userResponse(r, db)),
-        nextCursor,
-      });
-    },
-  );
-
-  app.get(
-    "/v2/users/:namespace",
-    routeLimiter((req) => clientIp(req)),
-    (req, res) => {
-      if (userDetailLimiter.isLimited(clientIp(req))) {
-        rateLimited(res);
-        return;
-      }
-
-      const user = db
-        .prepare("SELECT * FROM users WHERE namespace = ?")
-        .get(req.params.namespace);
-      if (!user) {
-        res.status(404).json({ error: "User not found." });
-        return;
-      }
-      res.json(userResponse(user, db));
-    },
-  );
-
-  app.patch(
-    "/v2/users/:namespace",
-    routeLimiter((req) => `${req.params.namespace}|${clientIp(req)}`),
-    async (req, res) => {
-      const auth = authenticate(db, req.headers.authorization);
-      if (!auth) {
-        res.status(401).json({ error: "Unauthorized." });
-        return;
-      }
-      if (
-        userPatchLimiter.isLimited(`${auth.user.namespace}|${clientIp(req)}`)
-      ) {
-        rateLimited(res);
-        return;
-      }
-      const target = db
-        .prepare("SELECT * FROM users WHERE namespace = ?")
-        .get(req.params.namespace);
-      if (!target) {
-        res.status(404).json({ error: "User not found." });
-        return;
-      }
-      if (auth.user.type !== "admin" && auth.user.id !== target.id) {
-        res.status(403).json({ error: "Forbidden." });
-        return;
-      }
-
-      const { displayName, password } = req.body || {};
-      if (displayName === undefined && password === undefined) {
-        res.status(400).json({ error: "At least one field is required." });
-        return;
-      }
-
-      if (displayName !== undefined && typeof displayName !== "string") {
-        res.status(400).json({ error: "displayName must be a string." });
-        return;
-      }
-      if (
-        password !== undefined &&
-        (typeof password !== "string" || password.length < 8)
-      ) {
-        res.status(400).json({
-          error: "password must be at least 8 characters.",
-        });
-        return;
-      }
-
-      if (displayName !== undefined) {
-        db.prepare("UPDATE users SET display_name = ? WHERE id = ?").run(
-          displayName,
-          target.id,
-        );
-      }
-      if (password !== undefined) {
-        const passwordHash = await hashPassword(password);
-        db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(
-          passwordHash,
-          target.id,
-        );
-        db.prepare("DELETE FROM auth_tokens WHERE user_id = ?").run(target.id);
-      }
-
-      const updated = db
-        .prepare("SELECT * FROM users WHERE id = ?")
-        .get(target.id);
-      res.json(userResponse(updated, db));
-    },
-  );
-
-  app.delete(
-    "/v2/users/:namespace",
-    routeLimiter((req) => `${req.params.namespace}|${clientIp(req)}`),
-    (req, res) => {
-      const auth = authenticate(db, req.headers.authorization);
-      if (!auth) {
-        res.status(401).json({ error: "Unauthorized." });
-        return;
-      }
-      if (
-        userDeleteLimiter.isLimited(`${auth.user.namespace}|${clientIp(req)}`)
-      ) {
-        rateLimited(res);
-        return;
-      }
-      const target = db
-        .prepare("SELECT * FROM users WHERE namespace = ?")
-        .get(req.params.namespace);
-      if (!target) {
-        res.status(404).json({ error: "User not found." });
-        return;
-      }
-      if (auth.user.type !== "admin" && auth.user.id !== target.id) {
-        res.status(403).json({ error: "Forbidden." });
-        return;
-      }
-
-      const versions = db
-        .prepare(
-          `SELECT version, blob_path FROM versions
+    const versions = db
+      .prepare(
+        `SELECT version, blob_path FROM versions
          WHERE owner_id = ?`,
-        )
-        .all(target.id);
+      )
+      .all(target.id);
 
-      const deleteUser = db.transaction((id) => {
-        db.prepare("DELETE FROM auth_tokens WHERE user_id = ?").run(id);
-        db.prepare("DELETE FROM versions WHERE owner_id = ?").run(id);
-        db.prepare("DELETE FROM users WHERE id = ?").run(id);
-      });
-      deleteUser(target.id);
+    const deleteUser = db.transaction((id) => {
+      db.prepare("DELETE FROM auth_tokens WHERE user_id = ?").run(id);
+      db.prepare("DELETE FROM versions WHERE owner_id = ?").run(id);
+      db.prepare("DELETE FROM users WHERE id = ?").run(id);
+    });
+    deleteUser(target.id);
 
-      for (const v of versions) {
-        fs.rmSync(v.blob_path, { force: true });
-      }
+    for (const v of versions) {
+      fs.rmSync(v.blob_path, { force: true });
+    }
 
-      res.status(200).json({ message: "Deleted." });
-    },
-  );
+    res.status(200).json({ message: "Deleted." });
+  });
 
   // ── Publish route ────────────────────────────────────────────────────
 
-  app.post(
-    "/v2/publish",
-    routeLimiter((req) => clientIp(req)),
-    (req, res, next) => {
-      const auth = authenticate(db, req.headers.authorization);
-      if (!auth) {
-        res.status(401).json({ error: "Unauthorized." });
-        return;
-      }
-      if (publishLimiter.isLimited(`${auth.user.namespace}|${clientIp(req)}`)) {
-        rateLimited(res);
-        return;
-      }
+  app.post("/v2/publish", routeLimiter, (req, res, next) => {
+    const auth = authenticate(db, req.headers.authorization);
+    if (!auth) {
+      res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
 
-      const { id, meta, extensionBlob } = req.body || {};
-      if (!id || typeof id !== "string") {
-        res.status(400).json({ error: "id is required." });
-        return;
-      }
-      if (!PACKAGE_ID_RE.test(id)) {
+    const { id, meta, extensionBlob } = req.body || {};
+    if (!id || typeof id !== "string") {
+      res.status(400).json({ error: "id is required." });
+      return;
+    }
+    if (!PACKAGE_ID_RE.test(id)) {
+      res.status(400).json({
+        error: "id must match ^[a-z0-9](?:[a-z0-9._-]{0,63})$.",
+      });
+      return;
+    }
+    if (!meta || typeof meta !== "object") {
+      res.status(400).json({ error: "meta is required." });
+      return;
+    }
+    if (!extensionBlob || typeof extensionBlob !== "string") {
+      res.status(400).json({ error: "extensionBlob is required." });
+      return;
+    }
+
+    const source = extensionBlob;
+    const {
+      ok,
+      meta: extractedMeta,
+      error: metaError,
+    } = extractWarpMeta(source);
+    if (!ok) {
+      res.status(400).json({ error: metaError });
+      error(metaError);
+      return;
+    }
+
+    if (extractedMeta.id !== id) {
+      res.status(400).json({
+        error: "meta.id must match the request id.",
+      });
+      return;
+    }
+
+    const version = semver.valid(extractedMeta.version);
+    if (version === null) {
+      res.status(400).json({
+        error: "meta.version must be a valid semver string.",
+      });
+      error("meta.version must be a valid semver string.");
+      return;
+    }
+    for (const field of ["name", "license", "description"]) {
+      if (
+        typeof extractedMeta[field] !== "string" ||
+        extractedMeta[field].length === 0
+      ) {
         res.status(400).json({
-          error: "id must match ^[a-z0-9](?:[a-z0-9._-]{0,63})$.",
+          error: `meta.${field} is required and must be a non-empty string.`,
         });
+        error(`meta.${field} is required and must be a non-empty string.`);
         return;
       }
-      if (!meta || typeof meta !== "object") {
-        res.status(400).json({ error: "meta is required." });
-        return;
-      }
-      if (!extensionBlob || typeof extensionBlob !== "string") {
-        res.status(400).json({ error: "extensionBlob is required." });
-        return;
-      }
+    }
 
-      const source = extensionBlob;
-      const {
-        ok,
-        meta: extractedMeta,
-        error: metaError,
-      } = extractWarpMeta(source);
-      if (!ok) {
-        res.status(400).json({ error: metaError });
-        error(metaError);
-        return;
-      }
+    const packageId = id;
+    const ownerName = auth.user.namespace;
 
-      if (extractedMeta.id !== id) {
-        res.status(400).json({
-          error: "meta.id must match the request id.",
-        });
-        return;
-      }
+    const existing = db
+      .prepare(
+        `SELECT id FROM versions WHERE owner_id = ? AND package_id = ? AND version = ?`,
+      )
+      .get(auth.user.id, packageId, version);
+    if (existing) {
+      res
+        .status(409)
+        .json({ error: "This version already exists for this owner." });
+      error("This version already exists for this owner.");
+      return;
+    }
 
-      const version = semver.valid(extractedMeta.version);
-      if (version === null) {
-        res.status(400).json({
-          error: "meta.version must be a valid semver string.",
-        });
-        error("meta.version must be a valid semver string.");
-        return;
-      }
-      for (const field of ["name", "license", "description"]) {
-        if (
-          typeof extractedMeta[field] !== "string" ||
-          extractedMeta[field].length === 0
-        ) {
-          res.status(400).json({
-            error: `meta.${field} is required and must be a non-empty string.`,
-          });
-          error(`meta.${field} is required and must be a non-empty string.`);
-          return;
-        }
-      }
-
-      const packageId = id;
-      const ownerName = auth.user.namespace;
-
-      const existing = db
-        .prepare(
-          `SELECT id FROM versions WHERE owner_id = ? AND package_id = ? AND version = ?`,
-        )
-        .get(auth.user.id, packageId, version);
-      if (existing) {
-        res
-          .status(409)
-          .json({ error: "This version already exists for this owner." });
-        error("This version already exists for this owner.");
-        return;
-      }
-
-      const pending = db
-        .prepare(
-          `SELECT id FROM versions
+    const pending = db
+      .prepare(
+        `SELECT id FROM versions
          WHERE owner_id = ? AND status IN ('staging', 'pending')
            AND NOT (package_id = ? AND version = ?)`,
-        )
-        .get(auth.user.id, packageId, version);
-      if (pending) {
+      )
+      .get(auth.user.id, packageId, version);
+    if (pending) {
+      res.status(403).json({
+        error:
+          "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+      });
+      return;
+    }
+
+    const safe = safeBlobPath(ownerName, packageId, version);
+    if (!safe.ok) {
+      res.status(400).json({ error: safe.error });
+      error(safe.error);
+      return;
+    }
+    const absBlobPath = safe.blobPath;
+    const tempBlobPath = `${absBlobPath}.tmp-${crypto
+      .randomBytes(6)
+      .toString("hex")}`;
+
+    let finalStatus;
+    try {
+      fs.mkdirSync(path.dirname(absBlobPath), { recursive: true });
+      fs.writeFileSync(tempBlobPath, source);
+
+      const outcome = db
+        .transaction(() => {
+          const current = db
+            .prepare("SELECT has_published FROM users WHERE id = ?")
+            .get(auth.user.id);
+          const derivedStatus =
+            current.has_published === 1 ? "published" : "pending";
+
+          const blocked =
+            current.has_published !== 1 &&
+            db
+              .prepare(
+                `SELECT id FROM versions
+                 WHERE owner_id = ? AND status = 'pending'
+                   AND NOT (package_id = ? AND version = ?)`,
+              )
+              .get(auth.user.id, packageId, version);
+
+          if (blocked) return { blocked: true };
+
+          db.prepare(
+            `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
+             VALUES (?, ?, ?, 'staging', ?, ?, ?)`,
+          ).run(
+            auth.user.id,
+            packageId,
+            version,
+            derivedStatus,
+            JSON.stringify(extractedMeta),
+            absBlobPath,
+          );
+          fs.renameSync(tempBlobPath, absBlobPath);
+          db.prepare(
+            `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
+          ).run(derivedStatus, auth.user.id, packageId, version);
+
+          return { status: derivedStatus };
+        })
+        .immediate();
+
+      if (outcome.blocked) {
+        fs.rmSync(tempBlobPath, { force: true });
         res.status(403).json({
           error:
             "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
         });
+        error(
+          "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+        );
         return;
       }
-
-      const absBlobPath = blobPath(dataDir, ownerName, packageId, version);
-      const tempBlobPath = `${absBlobPath}.tmp-${crypto
-        .randomBytes(6)
-        .toString("hex")}`;
-
-      let finalStatus;
-      try {
-        fs.mkdirSync(path.dirname(absBlobPath), { recursive: true });
-        fs.writeFileSync(tempBlobPath, source);
-
-        const outcome = db
-          .transaction(() => {
-            const current = db
-              .prepare("SELECT has_published FROM users WHERE id = ?")
-              .get(auth.user.id);
-            const derivedStatus =
-              current.has_published === 1 ? "published" : "pending";
-
-            const blocked =
-              current.has_published !== 1 &&
-              db
-                .prepare(
-                  `SELECT id FROM versions
-                 WHERE owner_id = ? AND status = 'pending'
-                   AND NOT (package_id = ? AND version = ?)`,
-                )
-                .get(auth.user.id, packageId, version);
-
-            if (blocked) return { blocked: true };
-
-            db.prepare(
-              `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
-             VALUES (?, ?, ?, 'staging', ?, ?, ?)`,
-            ).run(
-              auth.user.id,
-              packageId,
-              version,
-              derivedStatus,
-              JSON.stringify(extractedMeta),
-              absBlobPath,
-            );
-            fs.renameSync(tempBlobPath, absBlobPath);
-            db.prepare(
-              `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
-            ).run(derivedStatus, auth.user.id, packageId, version);
-
-            return { status: derivedStatus };
-          })
-          .immediate();
-
-        if (outcome.blocked) {
-          fs.rmSync(tempBlobPath, { force: true });
+      finalStatus = outcome.status;
+    } catch (err) {
+      fs.rmSync(tempBlobPath, { force: true });
+      const blobReferenced = db
+        .prepare("SELECT 1 FROM versions WHERE blob_path = ?")
+        .get(absBlobPath);
+      if (!blobReferenced) {
+        fs.rmSync(absBlobPath, { force: true });
+      }
+      if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
+        if (isPendingConflict(err, db, auth.user.id, packageId, version)) {
           res.status(403).json({
             error:
               "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
@@ -1110,395 +1010,322 @@ export function createApp({ db, dataDir }) {
           );
           return;
         }
-        finalStatus = outcome.status;
-      } catch (err) {
-        fs.rmSync(tempBlobPath, { force: true });
-        const blobReferenced = db
-          .prepare("SELECT 1 FROM versions WHERE blob_path = ?")
-          .get(absBlobPath);
-        if (!blobReferenced) {
-          fs.rmSync(absBlobPath, { force: true });
-        }
-        if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
-          if (isPendingConflict(err, db, auth.user.id, packageId, version)) {
-            res.status(403).json({
-              error:
-                "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
-            });
-            error(
-              "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
-            );
-            return;
-          }
-          res
-            .status(409)
-            .json({ error: "This version already exists for this owner." });
-          error("This version already exists for this owner.");
-          return;
-        }
-        next(err);
+        res
+          .status(409)
+          .json({ error: "This version already exists for this owner." });
+        error("This version already exists for this owner.");
         return;
       }
+      next(err);
+      return;
+    }
 
-      const versions = db
-        .prepare(
-          `SELECT version FROM versions
+    const versions = db
+      .prepare(
+        `SELECT version FROM versions
          WHERE owner_id = ? AND package_id = ? AND status = 'published'
          ORDER BY semverSortKey(version) DESC`,
-        )
-        .all(auth.user.id, packageId)
-        .map((r) => r.version);
+      )
+      .all(auth.user.id, packageId)
+      .map((r) => r.version);
 
-      res.status(201).json({
-        extension: {
-          owner: ownerName,
-          id: packageId,
-          meta: extractedMeta,
-          versions,
-          approved: finalStatus === "published",
-        },
-        publishedUrl: `/v2/@${ownerName}/${packageId}`,
-      });
+    res.status(201).json({
+      extension: {
+        owner: ownerName,
+        id: packageId,
+        meta: extractedMeta,
+        versions,
+        approved: finalStatus === "published",
+      },
+      publishedUrl: `/v2/@${ownerName}/${packageId}`,
+    });
 
-      success(`${ownerName}/${packageId}@${version} (${finalStatus})`);
-    },
-  );
+    success(`${ownerName}/${packageId}@${version} (${finalStatus})`);
+  });
 
   // ── Extension info ───────────────────────────────────────────────────
 
-  app.get(
-    "/v2/@:namespace/:id",
-    routeLimiter((req) => clientIp(req)),
-    (req, res) => {
-      if (extensionInfoLimiter.isLimited(clientIp(req))) {
-        rateLimited(res);
-        return;
-      }
-
-      const { namespace, id } = req.params;
-      const rows = db
-        .prepare(
-          `SELECT v.version, v.meta_json, v.status
+  app.get("/v2/@:namespace/:id", routeLimiter, (req, res) => {
+    const { namespace, id } = req.params;
+    const rows = db
+      .prepare(
+        `SELECT v.version, v.meta_json, v.status
          FROM versions v
          JOIN users u ON u.id = v.owner_id
          WHERE u.namespace = ? AND v.package_id = ? AND v.status = 'published'`,
-        )
-        .all(namespace, id);
+      )
+      .all(namespace, id);
 
-      if (rows.length === 0) {
-        res
-          .status(404)
-          .json({ error: "No published versions for this package." });
-        return;
-      }
+    if (rows.length === 0) {
+      res
+        .status(404)
+        .json({ error: "No published versions for this package." });
+      return;
+    }
 
-      rows.sort((a, b) => semver.compare(b.version, a.version));
-      const latest = rows[0];
-      const user = db
-        .prepare("SELECT id FROM users WHERE namespace = ?")
-        .get(namespace);
+    rows.sort((a, b) => semver.compare(b.version, a.version));
+    const latest = rows[0];
+    const user = db
+      .prepare("SELECT id FROM users WHERE namespace = ?")
+      .get(namespace);
 
-      res.json({
-        owner: namespace,
-        id,
-        meta: JSON.parse(latest.meta_json),
-        versions: rows.map((r) => r.version),
-        approved: user
-          ? db
-              .prepare(
-                `SELECT 1 FROM versions
+    res.json({
+      owner: namespace,
+      id,
+      meta: JSON.parse(latest.meta_json),
+      versions: rows.map((r) => r.version),
+      approved: user
+        ? db
+            .prepare(
+              `SELECT 1 FROM versions
                WHERE owner_id = ? AND package_id = ? AND status = 'published'`,
-              )
-              .get(user.id, id) !== undefined
-          : false,
-      });
-    },
-  );
+            )
+            .get(user.id, id) !== undefined
+        : false,
+    });
+  });
 
   // ── Update extension ─────────────────────────────────────────────────
 
-  app.patch(
-    "/v2/@:namespace/:id",
-    routeLimiter((req) => `${req.params.namespace}|${clientIp(req)}`),
-    (req, res) => {
-      const auth = authenticate(db, req.headers.authorization);
-      if (!auth) {
-        res.status(401).json({ error: "Unauthorized." });
+  app.patch("/v2/@:namespace/:id", routeLimiter, (req, res) => {
+    const auth = authenticate(db, req.headers.authorization);
+    if (!auth) {
+      res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
+    const { namespace, id } = req.params;
+    const target = db
+      .prepare("SELECT * FROM users WHERE namespace = ?")
+      .get(namespace);
+    if (!target) {
+      res.status(404).json({ error: "Extension not found." });
+      return;
+    }
+
+    const existingExt = db
+      .prepare(
+        `SELECT id FROM versions WHERE owner_id = ? AND package_id = ? AND status = 'published' LIMIT 1`,
+      )
+      .get(target.id, id);
+    if (!existingExt) {
+      res.status(404).json({ error: "Extension not found." });
+      return;
+    }
+
+    if (auth.user.type !== "admin" && auth.user.id !== target.id) {
+      res.status(403).json({ error: "Forbidden." });
+      return;
+    }
+
+    const { meta, extensionBlob } = req.body || {};
+    if (meta === undefined && extensionBlob === undefined) {
+      res.status(400).json({ error: "At least one field is required." });
+      return;
+    }
+
+    let finalMeta = meta;
+
+    if (extensionBlob !== undefined) {
+      if (typeof extensionBlob !== "string") {
+        res.status(400).json({ error: "extensionBlob must be a string." });
         return;
       }
-      if (
-        extensionPatchLimiter.isLimited(
-          `${auth.user.namespace}|${clientIp(req)}`,
-        )
-      ) {
-        rateLimited(res);
+      const {
+        ok,
+        meta: extractedMeta,
+        error: metaError,
+      } = extractWarpMeta(extensionBlob);
+      if (!ok) {
+        res.status(400).json({ error: metaError });
+        return;
+      }
+      finalMeta = extractedMeta;
+
+      if (!PACKAGE_ID_RE.test(id)) {
+        res.status(400).json({
+          error: "id must match ^[a-z0-9](?:[a-z0-9._-]{0,63})$.",
+        });
+        return;
+      }
+      if (!finalMeta || typeof finalMeta !== "object") {
+        res
+          .status(400)
+          .json({ error: "meta is required when uploading a blob." });
+        return;
+      }
+      const version = semver.valid(finalMeta.version);
+      if (version === null) {
+        res.status(400).json({
+          error: "meta.version must be a valid semver string.",
+        });
+        return;
+      }
+      if (finalMeta.id !== id) {
+        res.status(400).json({ error: "meta.id must match the request id." });
         return;
       }
 
-      const { namespace, id } = req.params;
-      const target = db
-        .prepare("SELECT * FROM users WHERE namespace = ?")
-        .get(namespace);
-      if (!target) {
-        res.status(404).json({ error: "Extension not found." });
+      const safe = safeBlobPath(namespace, id, version);
+      if (!safe.ok) {
+        res.status(400).json({ error: safe.error });
         return;
       }
+      const absBlobPath = safe.blobPath;
+      fs.mkdirSync(path.dirname(absBlobPath), { recursive: true });
+      fs.writeFileSync(absBlobPath, extensionBlob);
 
-      const existingExt = db
+      const existingVersion = db
         .prepare(
-          `SELECT id FROM versions WHERE owner_id = ? AND package_id = ? AND status = 'published' LIMIT 1`,
+          `SELECT id FROM versions WHERE owner_id = ? AND package_id = ? AND version = ?`,
         )
-        .get(target.id, id);
-      if (!existingExt) {
-        res.status(404).json({ error: "Extension not found." });
-        return;
-      }
+        .get(target.id, id, version);
+      if (existingVersion) {
+        db.prepare(
+          "UPDATE versions SET meta_json = ?, blob_path = ? WHERE id = ?",
+        ).run(JSON.stringify(finalMeta), absBlobPath, existingVersion.id);
+      } else {
+        const current = db
+          .prepare("SELECT has_published FROM users WHERE id = ?")
+          .get(target.id);
+        const derivedStatus =
+          current.has_published === 1 ? "published" : "pending";
 
-      if (auth.user.type !== "admin" && auth.user.id !== target.id) {
-        res.status(403).json({ error: "Forbidden." });
-        return;
-      }
-
-      const { meta, extensionBlob } = req.body || {};
-      if (meta === undefined && extensionBlob === undefined) {
-        res.status(400).json({ error: "At least one field is required." });
-        return;
-      }
-
-      let finalMeta = meta;
-
-      if (extensionBlob !== undefined) {
-        if (typeof extensionBlob !== "string") {
-          res.status(400).json({ error: "extensionBlob must be a string." });
-          return;
-        }
-        const {
-          ok,
-          meta: extractedMeta,
-          error: metaError,
-        } = extractWarpMeta(extensionBlob);
-        if (!ok) {
-          res.status(400).json({ error: metaError });
-          return;
-        }
-        finalMeta = extractedMeta;
-
-        if (!PACKAGE_ID_RE.test(id)) {
-          res.status(400).json({
-            error: "id must match ^[a-z0-9](?:[a-z0-9._-]{0,63})$.",
-          });
-          return;
-        }
-        if (!finalMeta || typeof finalMeta !== "object") {
-          res
-            .status(400)
-            .json({ error: "meta is required when uploading a blob." });
-          return;
-        }
-        const version = semver.valid(finalMeta.version);
-        if (version === null) {
-          res.status(400).json({
-            error: "meta.version must be a valid semver string.",
-          });
-          return;
-        }
-        if (finalMeta.id !== id) {
-          res.status(400).json({ error: "meta.id must match the request id." });
-          return;
-        }
-
-        const safe = safeBlobPath(namespace, id, version);
-        if (!safe.ok) {
-          res.status(400).json({ error: safe.error });
-          return;
-        }
-        const absBlobPath = safe.blobPath;
-        fs.mkdirSync(path.dirname(absBlobPath), { recursive: true });
-        fs.writeFileSync(absBlobPath, extensionBlob);
-
-        const existingVersion = db
-          .prepare(
-            `SELECT id FROM versions WHERE owner_id = ? AND package_id = ? AND version = ?`,
-          )
-          .get(target.id, id, version);
-        if (existingVersion) {
-          db.prepare(
-            "UPDATE versions SET meta_json = ?, blob_path = ? WHERE id = ?",
-          ).run(JSON.stringify(finalMeta), absBlobPath, existingVersion.id);
-        } else {
-          const current = db
-            .prepare("SELECT has_published FROM users WHERE id = ?")
-            .get(target.id);
-          const derivedStatus =
-            current.has_published === 1 ? "published" : "pending";
-
-          const blocked =
-            current.has_published !== 1 &&
-            db
-              .prepare(
-                `SELECT id FROM versions
+        const blocked =
+          current.has_published !== 1 &&
+          db
+            .prepare(
+              `SELECT id FROM versions
                WHERE owner_id = ? AND status IN ('staging', 'pending')
                  AND NOT (package_id = ? AND version = ?)`,
-              )
-              .get(target.id, id, version);
-          if (blocked) {
-            fs.rmSync(absBlobPath, { force: true });
-            res.status(409).json({
-              error:
-                "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
-            });
-            return;
-          }
-
-          db.prepare(
-            `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
-           VALUES (?, ?, ?, 'staging', ?, ?, ?)`,
-          ).run(
-            target.id,
-            id,
-            version,
-            derivedStatus,
-            JSON.stringify(finalMeta),
-            absBlobPath,
-          );
-          db.prepare(
-            `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
-          ).run(derivedStatus, target.id, id, version);
+            )
+            .get(target.id, id, version);
+        if (blocked) {
+          fs.rmSync(absBlobPath, { force: true });
+          res.status(409).json({
+            error:
+              "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+          });
+          return;
         }
-      }
 
-      if (finalMeta) {
-        const latestRow = db
-          .prepare(
-            `SELECT v.id FROM versions v
+        db.prepare(
+          `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
+           VALUES (?, ?, ?, 'staging', ?, ?, ?)`,
+        ).run(
+          target.id,
+          id,
+          version,
+          derivedStatus,
+          JSON.stringify(finalMeta),
+          absBlobPath,
+        );
+        db.prepare(
+          `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
+        ).run(derivedStatus, target.id, id, version);
+      }
+    }
+
+    if (finalMeta) {
+      const latestRow = db
+        .prepare(
+          `SELECT v.id FROM versions v
            WHERE v.owner_id = ? AND v.package_id = ? AND v.status = 'published'
            ORDER BY semverSortKey(v.version) DESC LIMIT 1`,
-          )
-          .get(target.id, id);
-        if (latestRow) {
-          db.prepare("UPDATE versions SET meta_json = ? WHERE id = ?").run(
-            JSON.stringify(finalMeta),
-            latestRow.id,
-          );
-        }
-      }
-
-      const versions = db
-        .prepare(
-          `SELECT version FROM versions
-         WHERE owner_id = ? AND package_id = ? AND status = 'published'
-         ORDER BY semverSortKey(version) DESC`,
-        )
-        .all(target.id, id)
-        .map((r) => r.version);
-
-      const metaRow = db
-        .prepare(
-          `SELECT meta_json FROM versions
-         WHERE owner_id = ? AND package_id = ? AND status = 'published'
-         ORDER BY semverSortKey(version) DESC LIMIT 1`,
         )
         .get(target.id, id);
+      if (latestRow) {
+        db.prepare("UPDATE versions SET meta_json = ? WHERE id = ?").run(
+          JSON.stringify(finalMeta),
+          latestRow.id,
+        );
+      }
+    }
 
-      res.json({
-        owner: namespace,
-        id,
-        meta: metaRow ? JSON.parse(metaRow.meta_json) : finalMeta,
-        versions,
-        approved: true,
-      });
-    },
-  );
+    const versions = db
+      .prepare(
+        `SELECT version FROM versions
+         WHERE owner_id = ? AND package_id = ? AND status = 'published'
+         ORDER BY semverSortKey(version) DESC`,
+      )
+      .all(target.id, id)
+      .map((r) => r.version);
+
+    const metaRow = db
+      .prepare(
+        `SELECT meta_json FROM versions
+         WHERE owner_id = ? AND package_id = ? AND status = 'published'
+         ORDER BY semverSortKey(version) DESC LIMIT 1`,
+      )
+      .get(target.id, id);
+
+    res.json({
+      owner: namespace,
+      id,
+      meta: metaRow ? JSON.parse(metaRow.meta_json) : finalMeta,
+      versions,
+      approved: true,
+    });
+  });
 
   // ── Delete extension ─────────────────────────────────────────────────
 
-  app.delete(
-    "/v2/@:namespace/:id",
-    routeLimiter((req) => `${req.params.namespace}|${clientIp(req)}`),
-    (req, res) => {
-      const auth = authenticate(db, req.headers.authorization);
-      if (!auth) {
-        res.status(401).json({ error: "Unauthorized." });
-        return;
-      }
-      if (
-        extensionDeleteLimiter.isLimited(
-          `${auth.user.namespace}|${clientIp(req)}`,
-        )
-      ) {
-        rateLimited(res);
-        return;
-      }
+  app.delete("/v2/@:namespace/:id", routeLimiter, (req, res) => {
+    const auth = authenticate(db, req.headers.authorization);
+    if (!auth) {
+      res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
+    const { namespace, id } = req.params;
+    const target = db
+      .prepare("SELECT * FROM users WHERE namespace = ?")
+      .get(namespace);
+    if (!target) {
+      res.status(404).json({ error: "Extension not found." });
+      return;
+    }
 
-      const { namespace, id } = req.params;
-      const target = db
-        .prepare("SELECT * FROM users WHERE namespace = ?")
-        .get(namespace);
-      if (!target) {
-        res.status(404).json({ error: "Extension not found." });
-        return;
-      }
-
-      const versions = db
-        .prepare(
-          `SELECT version, blob_path FROM versions
+    const versions = db
+      .prepare(
+        `SELECT version, blob_path FROM versions
          WHERE owner_id = ? AND package_id = ?`,
-        )
-        .all(target.id, id);
-      if (versions.length === 0) {
-        res.status(404).json({ error: "Extension not found." });
-        return;
-      }
+      )
+      .all(target.id, id);
+    if (versions.length === 0) {
+      res.status(404).json({ error: "Extension not found." });
+      return;
+    }
 
-      if (auth.user.type !== "admin" && auth.user.id !== target.id) {
-        res.status(403).json({ error: "Forbidden." });
-        return;
-      }
+    if (auth.user.type !== "admin" && auth.user.id !== target.id) {
+      res.status(403).json({ error: "Forbidden." });
+      return;
+    }
 
-      for (const v of versions) {
-        fs.rmSync(v.blob_path, { force: true });
-      }
-      db.prepare(
-        "DELETE FROM versions WHERE owner_id = ? AND package_id = ?",
-      ).run(target.id, id);
+    for (const v of versions) {
+      fs.rmSync(v.blob_path, { force: true });
+    }
+    db.prepare(
+      "DELETE FROM versions WHERE owner_id = ? AND package_id = ?",
+    ).run(target.id, id);
 
-      res.status(200).json({ message: "Deleted." });
-    },
-  );
+    res.status(200).json({ message: "Deleted." });
+  });
 
   // ── Serve extension source by version ────────────────────────────────
 
-  app.get(
-    "/v2/@:namespace/:id/:version",
-    routeLimiter((req) => clientIp(req)),
-    (req, res) => {
-      if (versionBlobLimiter.isLimited(clientIp(req))) {
-        rateLimited(res);
-        return;
-      }
-
-      const { namespace, id } = req.params;
-      const versionParam = req.params.version;
-      const safe = safeBlobPath(namespace, id, versionParam);
-      if (!safe.ok) {
-        res.status(404).json({ error: "Version not found." });
-        return;
-      }
-      if (versionParam === "latest") {
-        const latest = findLatest(db, namespace, id);
-        if (!latest) {
-          res
-            .status(404)
-            .json({ error: "No published versions for this package." });
-          return;
-        }
-        serveBlob(req, res, {
-          db,
-          dataDir,
-          owner: namespace,
-          id,
-          version: latest.version,
-        });
+  app.get("/v2/@:namespace/:id/:version", routeLimiter, (req, res) => {
+    const { namespace, id } = req.params;
+    const versionParam = req.params.version;
+    const safe = safeBlobPath(namespace, id, versionParam);
+    if (!safe.ok) {
+      res.status(404).json({ error: "Version not found." });
+      return;
+    }
+    if (versionParam === "latest") {
+      const latest = findLatest(db, namespace, id);
+      if (!latest) {
+        res
+          .status(404)
+          .json({ error: "No published versions for this package." });
         return;
       }
       serveBlob(req, res, {
@@ -1506,67 +1333,67 @@ export function createApp({ db, dataDir }) {
         dataDir,
         owner: namespace,
         id,
-        version: versionParam,
+        version: latest.version,
       });
-    },
-  );
+      return;
+    }
+    serveBlob(req, res, {
+      db,
+      dataDir,
+      owner: namespace,
+      id,
+      version: versionParam,
+    });
+  });
 
   // ── Approve extension (admin only) ───────────────────────────────────
 
-  app.post(
-    "/v2/@:namespace/:id/approve",
-    routeLimiter((req) => `${req.params.namespace}|${clientIp(req)}`),
-    (req, res) => {
-      const auth = authenticate(db, req.headers.authorization);
-      if (!auth) {
-        res.status(401).json({ error: "Unauthorized." });
-        return;
-      }
-      if (auth.user.type !== "admin") {
-        res.status(403).json({ error: "Admin required." });
-        return;
-      }
-      if (approveLimiter.isLimited(`${auth.user.namespace}|${clientIp(req)}`)) {
-        rateLimited(res);
-        return;
-      }
+  app.post("/v2/@:namespace/:id/approve", routeLimiter, (req, res) => {
+    const auth = authenticate(db, req.headers.authorization);
+    if (!auth) {
+      res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
+    if (auth.user.type !== "admin") {
+      res.status(403).json({ error: "Admin required." });
+      return;
+    }
 
-      const { namespace, id } = req.params;
-      const target = db
-        .prepare("SELECT * FROM users WHERE namespace = ?")
-        .get(namespace);
-      if (!target) {
-        res.status(404).json({ error: "Extension not found." });
-        return;
-      }
+    const { namespace, id } = req.params;
+    const target = db
+      .prepare("SELECT * FROM users WHERE namespace = ?")
+      .get(namespace);
+    if (!target) {
+      res.status(404).json({ error: "Extension not found." });
+      return;
+    }
 
-      const latestPending = db
-        .prepare(
-          `SELECT id, version FROM versions
+    const latestPending = db
+      .prepare(
+        `SELECT id, version FROM versions
          WHERE owner_id = ? AND package_id = ? AND status = 'pending'
          ORDER BY semverSortKey(version) DESC LIMIT 1`,
-        )
-        .get(target.id, id);
+      )
+      .get(target.id, id);
 
-      if (!latestPending) {
-        res.status(404).json({ error: "No pending version found." });
-        return;
-      }
+    if (!latestPending) {
+      res.status(404).json({ error: "No pending version found." });
+      return;
+    }
 
-      db.transaction(() => {
-        db.prepare(
-          `UPDATE versions SET status = 'published'
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE versions SET status = 'published'
          WHERE owner_id = ? AND package_id = ? AND status = 'pending'`,
-        ).run(target.id, id);
-        db.prepare("UPDATE users SET has_published = 1 WHERE id = ?").run(
-          target.id,
-        );
-      })();
+      ).run(target.id, id);
+      db.prepare("UPDATE users SET has_published = 1 WHERE id = ?").run(
+        target.id,
+      );
+    })();
 
-      success(`Approved ${namespace}/${id}@${latestPending.version}`);
-      res.status(200).json({ message: "Approved." });
-    },
-  );
+    success(`Approved ${namespace}/${id}@${latestPending.version}`);
+    res.status(200).json({ message: "Approved." });
+  });
 
   // ── Search ───────────────────────────────────────────────────────────
 
@@ -1583,231 +1410,204 @@ export function createApp({ db, dataDir }) {
     WHERE v.status = 'published'
   `;
 
-  app.get(
-    "/v2/search",
-    routeLimiter((req) => clientIp(req)),
-    (req, res) => {
-      if (searchLimiter.isLimited(clientIp(req))) {
-        rateLimited(res);
-        return;
-      }
+  app.get("/v2/search", routeLimiter, (req, res) => {
+    const raw = typeof req.query.query === "string" ? req.query.query : "";
+    const q = raw.trim();
 
-      const raw = typeof req.query.query === "string" ? req.query.query : "";
-      const q = raw.trim();
+    const decodedCursor = decodeCursor(
+      req.query.cursor,
+      (d) =>
+        typeof d.createdAt === "string" &&
+        typeof d.owner === "string" &&
+        typeof d.packageId === "string",
+    );
+    if (!decodedCursor.ok) {
+      res.status(400).json({ error: "Invalid cursor." });
+      return;
+    }
+    const cursor = decodedCursor.value;
 
-      const decodedCursor = decodeCursor(
-        req.query.cursor,
-        (d) =>
-          typeof d.createdAt === "string" &&
-          typeof d.owner === "string" &&
-          typeof d.packageId === "string",
-      );
-      if (!decodedCursor.ok) {
-        res.status(400).json({ error: "Invalid cursor." });
-        return;
-      }
-      const cursor = decodedCursor.value;
-
-      let where = "WHERE t.rn = 1";
-      const params = [];
-      if (cursor) {
-        where += ` AND (
+    let where = "WHERE t.rn = 1";
+    const params = [];
+    if (cursor) {
+      where += ` AND (
         t.created_at < ? OR
         (t.created_at = ? AND (t.owner > ? OR (t.owner = ? AND t.id > ?)))
       )`;
-        params.push(
-          cursor.createdAt,
-          cursor.createdAt,
-          cursor.owner,
-          cursor.owner,
-          cursor.packageId,
-        );
-      }
+      params.push(
+        cursor.createdAt,
+        cursor.createdAt,
+        cursor.owner,
+        cursor.owner,
+        cursor.packageId,
+      );
+    }
 
-      if (q) {
-        const escaped = q
-          .replace(/\\/g, "\\\\")
-          .replace(/%/g, "\\%")
-          .replace(/_/g, "\\_");
-        const pattern = `%${escaped}%`;
-        where += ` AND (unicode_fold(json_extract(t.meta_json, '$.name'))
+    if (q) {
+      const escaped = q
+        .replace(/\\/g, "\\\\")
+        .replace(/%/g, "\\%")
+        .replace(/_/g, "\\_");
+      const pattern = `%${escaped}%`;
+      where += ` AND (unicode_fold(json_extract(t.meta_json, '$.name'))
                 LIKE unicode_fold(?) ESCAPE '\\'
               OR json_extract(t.meta_json, '$.version') LIKE ? ESCAPE '\\'
               OR json_extract(t.meta_json, '$.license') LIKE ? ESCAPE '\\'
               OR json_extract(t.meta_json, '$.description') LIKE ? ESCAPE '\\'
               OR t.id LIKE ? ESCAPE '\\'
               OR t.owner LIKE ? ESCAPE '\\')`;
-        params.push(pattern, pattern, pattern, pattern, pattern, pattern);
-      }
+      params.push(pattern, pattern, pattern, pattern, pattern, pattern);
+    }
 
-      const rows = db
-        .prepare(
-          `SELECT owner, id, meta_json, latestVersion, created_at
+    const rows = db
+      .prepare(
+        `SELECT owner, id, meta_json, latestVersion, created_at
          FROM (${latestPublishedSelections}) t
          ${where}
          ORDER BY t.created_at DESC, t.owner ASC, t.id ASC
          LIMIT ?`,
-        )
-        .all(...params, SEARCH_PAGE_SIZE + 1);
+      )
+      .all(...params, SEARCH_PAGE_SIZE + 1);
 
-      const hasMore = rows.length > SEARCH_PAGE_SIZE;
-      const page = rows.slice(0, SEARCH_PAGE_SIZE);
+    const hasMore = rows.length > SEARCH_PAGE_SIZE;
+    const page = rows.slice(0, SEARCH_PAGE_SIZE);
 
-      let nextCursor = null;
-      if (hasMore) {
-        const last = page[page.length - 1];
-        nextCursor = Buffer.from(
-          JSON.stringify({
-            createdAt: last.created_at,
-            owner: last.owner,
-            packageId: last.id,
-          }),
-        ).toString("base64");
-      }
-
-      res.json({
-        results: page.map((r) => {
-          const meta = JSON.parse(r.meta_json);
-          return {
-            owner: r.owner,
-            id: r.id,
-            name: meta.name,
-            description: meta.description,
-            latestVersion: r.latestVersion,
-          };
+    let nextCursor = null;
+    if (hasMore) {
+      const last = page[page.length - 1];
+      nextCursor = Buffer.from(
+        JSON.stringify({
+          createdAt: last.created_at,
+          owner: last.owner,
+          packageId: last.id,
         }),
-        nextCursor,
-      });
-    },
-  );
+      ).toString("base64");
+    }
+
+    res.json({
+      results: page.map((r) => {
+        const meta = JSON.parse(r.meta_json);
+        return {
+          owner: r.owner,
+          id: r.id,
+          name: meta.name,
+          description: meta.description,
+          latestVersion: r.latestVersion,
+        };
+      }),
+      nextCursor,
+    });
+  });
 
   // ── Extensions ───────────────────────────────────────────────────────
 
-  app.get(
-    "/v2/extensions",
-    routeLimiter((req) => clientIp(req)),
-    (req, res) => {
-      if (extensionsListLimiter.isLimited(clientIp(req))) {
-        rateLimited(res);
+  app.get("/v2/extensions", routeLimiter, (req, res) => {
+    let limit = 20;
+    if (req.query.limit !== undefined) {
+      const parsed = Number(req.query.limit);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        res.status(400).json({ error: "limit must be a positive integer." });
         return;
       }
+      limit = parsed;
+    }
+    limit = Math.min(limit, 50);
 
-      let limit = 20;
-      if (req.query.limit !== undefined) {
-        const parsed = Number(req.query.limit);
-        if (!Number.isInteger(parsed) || parsed <= 0) {
-          res.status(400).json({ error: "limit must be a positive integer." });
-          return;
-        }
-        limit = parsed;
-      }
-      limit = Math.min(limit, 50);
+    const decodedCursor = decodeCursor(
+      req.query.cursor,
+      (d) =>
+        typeof d.createdAt === "string" &&
+        typeof d.owner === "string" &&
+        typeof d.packageId === "string",
+    );
+    if (!decodedCursor.ok) {
+      res.status(400).json({ error: "Invalid cursor." });
+      return;
+    }
+    const cursor = decodedCursor.value;
 
-      const decodedCursor = decodeCursor(
-        req.query.cursor,
-        (d) =>
-          typeof d.createdAt === "string" &&
-          typeof d.owner === "string" &&
-          typeof d.packageId === "string",
-      );
-      if (!decodedCursor.ok) {
-        res.status(400).json({ error: "Invalid cursor." });
-        return;
-      }
-      const cursor = decodedCursor.value;
-
-      let where = "WHERE t.rn = 1";
-      const params = [];
-      if (cursor) {
-        where += ` AND (
+    let where = "WHERE t.rn = 1";
+    const params = [];
+    if (cursor) {
+      where += ` AND (
         t.created_at < ? OR
         (t.created_at = ? AND (t.owner > ? OR (t.owner = ? AND t.id > ?)))
       )`;
-        params.push(
-          cursor.createdAt,
-          cursor.createdAt,
-          cursor.owner,
-          cursor.owner,
-          cursor.packageId,
-        );
-      }
+      params.push(
+        cursor.createdAt,
+        cursor.createdAt,
+        cursor.owner,
+        cursor.owner,
+        cursor.packageId,
+      );
+    }
 
-      const rows = db
-        .prepare(
-          `SELECT t.owner, t.id, t.meta_json, t.latestVersion, t.created_at
+    const rows = db
+      .prepare(
+        `SELECT t.owner, t.id, t.meta_json, t.latestVersion, t.created_at
          FROM (${latestPublishedSelections}) t
          ${where}
          ORDER BY t.created_at DESC, t.owner ASC, t.id ASC
          LIMIT ?`,
-        )
-        .all(...params, limit + 1);
+      )
+      .all(...params, limit + 1);
 
-      const hasMore = rows.length > limit;
-      const page = rows.slice(0, limit);
+    const hasMore = rows.length > limit;
+    const page = rows.slice(0, limit);
 
-      let nextCursor = null;
-      if (hasMore) {
-        const last = page[page.length - 1];
-        nextCursor = Buffer.from(
-          JSON.stringify({
-            createdAt: last.created_at,
-            owner: last.owner,
-            packageId: last.id,
-          }),
-        ).toString("base64");
-      }
-
-      res.json({
-        extensions: page.map((r) => {
-          const meta = JSON.parse(r.meta_json);
-          return {
-            owner: r.owner,
-            id: r.id,
-            name: meta.name,
-            description: meta.description,
-            latestVersion: r.latestVersion,
-            publishedAt: `${r.created_at.replace(" ", "T")}Z`,
-          };
+    let nextCursor = null;
+    if (hasMore) {
+      const last = page[page.length - 1];
+      nextCursor = Buffer.from(
+        JSON.stringify({
+          createdAt: last.created_at,
+          owner: last.owner,
+          packageId: last.id,
         }),
-        nextCursor,
-      });
-    },
-  );
+      ).toString("base64");
+    }
+
+    res.json({
+      extensions: page.map((r) => {
+        const meta = JSON.parse(r.meta_json);
+        return {
+          owner: r.owner,
+          id: r.id,
+          name: meta.name,
+          description: meta.description,
+          latestVersion: r.latestVersion,
+          publishedAt: `${r.created_at.replace(" ", "T")}Z`,
+        };
+      }),
+      nextCursor,
+    });
+  });
 
   // ── Stats ────────────────────────────────────────────────────────────
 
-  app.get(
-    "/v2/stats",
-    routeLimiter((req) => clientIp(req)),
-    (req, res) => {
-      if (statsLimiter.isLimited(clientIp(req))) {
-        rateLimited(res);
-        return;
-      }
-
-      const published = db
-        .prepare(
-          `SELECT COUNT(*) AS c FROM (
+  app.get("/v2/stats", routeLimiter, (req, res) => {
+    const published = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM (
            SELECT 1 FROM versions WHERE status = 'published'
            GROUP BY owner_id, package_id
          )`,
-        )
-        .get().c;
-      const pending = db
-        .prepare(`SELECT COUNT(*) AS c FROM versions WHERE status = 'pending'`)
-        .get().c;
-      const authors = db
-        .prepare(
-          `SELECT COUNT(*) AS c FROM (
+      )
+      .get().c;
+    const pending = db
+      .prepare(`SELECT COUNT(*) AS c FROM versions WHERE status = 'pending'`)
+      .get().c;
+    const authors = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM (
            SELECT 1 FROM versions WHERE status = 'published'
            GROUP BY owner_id
          )`,
-        )
-        .get().c;
+      )
+      .get().c;
 
-      res.json({ published, pending, authors });
-    },
-  );
+    res.json({ published, pending, authors });
+  });
 
   // ── Error handling ───────────────────────────────────────────────────
 
