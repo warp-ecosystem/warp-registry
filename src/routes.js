@@ -42,6 +42,15 @@ const RATE_LIMIT_MAX = 5;
 const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 
 /**
+ * Default limit for the general-purpose request rate limiter. Generous on
+ * purpose: these limiters guard read-heavy and mutating endpoints against
+ * scraping/DoS-style floods while remaining permissive enough for legitimate
+ * traffic and tooling.
+ */
+const REQUEST_RATE_LIMIT_MAX = 1000;
+const REQUEST_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+
+/**
  * Fixed page size used for paginated /search results.
  */
 const SEARCH_PAGE_SIZE = 10;
@@ -129,6 +138,37 @@ function createSignupLimiter() {
       } else {
         buckets.set(key, { count: 1, reserved: 0, firstAt: now });
       }
+    },
+  };
+}
+
+/**
+ * General-purpose per-key rate limiter that counts requests (both successful
+ * and failed). Unlike {@link createRateLimiter} which only tracks failures,
+ * this counts every request so it can be used for read-heavy or mutating
+ * endpoints where any volume of requests is the concern.
+ * @param {number} [maxRequests] - Max requests allowed in the window.
+ * @returns {{ isLimited: (key: string, now?: number) => boolean }}
+ */
+function createRequestRateLimiter(maxRequests = REQUEST_RATE_LIMIT_MAX) {
+  const buckets = new Map();
+  function sweep(now = Date.now()) {
+    for (const [key, entry] of buckets) {
+      if (now - entry.firstAt > REQUEST_RATE_LIMIT_WINDOW_MS) {
+        buckets.delete(key);
+      }
+    }
+  }
+  return {
+    isLimited(key, now = Date.now()) {
+      sweep(now);
+      const entry = buckets.get(key);
+      if (!entry) {
+        buckets.set(key, { count: 1, firstAt: now });
+        return false;
+      }
+      entry.count += 1;
+      return entry.count > maxRequests;
     },
   };
 }
@@ -386,7 +426,7 @@ function isPendingConflict(err, db, ownerId, packageId, version) {
  * @returns {{user: object, tokenHash: string}|null} The authenticated user and token hash, or null.
  */
 function authenticate(db, authHeader) {
-  const match = /^Bearer\s+(.+)$/i.exec(authHeader || "");
+  const match = /^Bearer\s+(\S+)$/i.exec(authHeader || "");
   if (!match) return null;
   const token = match[1].trim();
   const tokenHash = hashToken(token);
@@ -478,12 +518,55 @@ export function createApp({ db, dataDir }) {
   const rateLimiter = createRateLimiter();
   const signupLimiter = createSignupLimiter();
 
+  // Per-route request rate limiters (different limits by endpoint type)
+  const logoutLimiter = createRequestRateLimiter();
+  const usersListLimiter = createRequestRateLimiter();
+  const userDetailLimiter = createRequestRateLimiter();
+  const userPatchLimiter = createRequestRateLimiter();
+  const userDeleteLimiter = createRequestRateLimiter();
+  const publishLimiter = createRequestRateLimiter();
+  const extensionInfoLimiter = createRequestRateLimiter();
+  const extensionPatchLimiter = createRequestRateLimiter();
+  const extensionDeleteLimiter = createRequestRateLimiter();
+  const versionBlobLimiter = createRequestRateLimiter();
+  const approveLimiter = createRequestRateLimiter();
+  const searchLimiter = createRequestRateLimiter();
+  const extensionsListLimiter = createRequestRateLimiter();
+  const statsLimiter = createRequestRateLimiter();
+
   const rateLimited = (res) => {
     res.status(429).json({ error: "Too many attempts. Try again later." });
   };
 
   const clientIp = (req) =>
     req.ip || (req.socket && req.socket.remoteAddress) || "unknown";
+
+  const blobsBase = blobsDir(dataDir);
+
+  /**
+   * Validates that namespace, id, and version params are safe and that the
+   * resulting blob path stays within the intended blobs directory.
+   * @param {string} ns - The namespace parameter.
+   * @param {string} pkgId - The package id parameter.
+   * @param {string} ver - The version parameter (must be semver or "latest").
+   * @returns {{ ok: boolean, blobPath?: string, error?: string }}
+   */
+  function safeBlobPath(ns, pkgId, ver) {
+    if (!NAMESPACE_RE.test(ns)) {
+      return { ok: false, error: "Invalid namespace." };
+    }
+    if (!PACKAGE_ID_RE.test(pkgId)) {
+      return { ok: false, error: "Invalid package id." };
+    }
+    if (ver !== "latest" && semver.valid(ver) === null) {
+      return { ok: false, error: "Invalid version." };
+    }
+    const resolved = path.resolve(blobPath(dataDir, ns, pkgId, ver));
+    if (!resolved.startsWith(path.resolve(blobsBase) + path.sep)) {
+      return { ok: false, error: "Invalid path." };
+    }
+    return { ok: true, blobPath: resolved };
+  }
 
   app.post("/v2/auth/signup", async (req, res) => {
     const { namespace, displayName, password } = req.body || {};
@@ -614,6 +697,14 @@ export function createApp({ db, dataDir }) {
       res.status(401).json({ error: "Unauthorized." });
       return;
     }
+    if (
+      logoutLimiter.isLimited(
+        `${auth.user.namespace}|${clientIp(req)}`,
+      )
+    ) {
+      rateLimited(res);
+      return;
+    }
     db.prepare("DELETE FROM auth_tokens WHERE token_hash = ?").run(
       auth.tokenHash,
     );
@@ -623,6 +714,11 @@ export function createApp({ db, dataDir }) {
   // ── User routes ──────────────────────────────────────────────────────
 
   app.get("/v2/users", (req, res) => {
+    if (usersListLimiter.isLimited(clientIp(req))) {
+      rateLimited(res);
+      return;
+    }
+
     let limit = 20;
     if (req.query.limit !== undefined) {
       const parsed = Number(req.query.limit);
@@ -668,6 +764,11 @@ export function createApp({ db, dataDir }) {
   });
 
   app.get("/v2/users/:namespace", (req, res) => {
+    if (userDetailLimiter.isLimited(clientIp(req))) {
+      rateLimited(res);
+      return;
+    }
+
     const user = db
       .prepare("SELECT * FROM users WHERE namespace = ?")
       .get(req.params.namespace);
@@ -682,6 +783,14 @@ export function createApp({ db, dataDir }) {
     const auth = authenticate(db, req.headers.authorization);
     if (!auth) {
       res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
+    if (
+      userPatchLimiter.isLimited(
+        `${auth.user.namespace}|${clientIp(req)}`,
+      )
+    ) {
+      rateLimited(res);
       return;
     }
     const target = db
@@ -743,6 +852,14 @@ export function createApp({ db, dataDir }) {
       res.status(401).json({ error: "Unauthorized." });
       return;
     }
+    if (
+      userDeleteLimiter.isLimited(
+        `${auth.user.namespace}|${clientIp(req)}`,
+      )
+    ) {
+      rateLimited(res);
+      return;
+    }
     const target = db
       .prepare("SELECT * FROM users WHERE namespace = ?")
       .get(req.params.namespace);
@@ -782,6 +899,14 @@ export function createApp({ db, dataDir }) {
     const auth = authenticate(db, req.headers.authorization);
     if (!auth) {
       res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
+    if (
+      publishLimiter.isLimited(
+        `${auth.user.namespace}|${clientIp(req)}`,
+      )
+    ) {
+      rateLimited(res);
       return;
     }
 
@@ -993,6 +1118,11 @@ export function createApp({ db, dataDir }) {
   // ── Extension info ───────────────────────────────────────────────────
 
   app.get("/v2/@:namespace/:id", (req, res) => {
+    if (extensionInfoLimiter.isLimited(clientIp(req))) {
+      rateLimited(res);
+      return;
+    }
+
     const { namespace, id } = req.params;
     const rows = db
       .prepare(
@@ -1038,6 +1168,14 @@ export function createApp({ db, dataDir }) {
     const auth = authenticate(db, req.headers.authorization);
     if (!auth) {
       res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
+    if (
+      extensionPatchLimiter.isLimited(
+        `${auth.user.namespace}|${clientIp(req)}`,
+      )
+    ) {
+      rateLimited(res);
       return;
     }
 
@@ -1113,7 +1251,12 @@ export function createApp({ db, dataDir }) {
         return;
       }
 
-      const absBlobPath = blobPath(dataDir, namespace, id, version);
+      const safe = safeBlobPath(namespace, id, version);
+      if (!safe.ok) {
+        res.status(400).json({ error: safe.error });
+        return;
+      }
+      const absBlobPath = safe.blobPath;
       fs.mkdirSync(path.dirname(absBlobPath), { recursive: true });
       fs.writeFileSync(absBlobPath, extensionBlob);
 
@@ -1218,6 +1361,14 @@ export function createApp({ db, dataDir }) {
       res.status(401).json({ error: "Unauthorized." });
       return;
     }
+    if (
+      extensionDeleteLimiter.isLimited(
+        `${auth.user.namespace}|${clientIp(req)}`,
+      )
+    ) {
+      rateLimited(res);
+      return;
+    }
 
     const { namespace, id } = req.params;
     const target = db
@@ -1257,8 +1408,19 @@ export function createApp({ db, dataDir }) {
   // ── Serve extension source by version ────────────────────────────────
 
   app.get("/v2/@:namespace/:id/:version", (req, res) => {
-    const { namespace, id, version } = req.params;
-    if (version === "latest") {
+    if (versionBlobLimiter.isLimited(clientIp(req))) {
+      rateLimited(res);
+      return;
+    }
+
+    const { namespace, id } = req.params;
+    const versionParam = req.params.version;
+    const safe = safeBlobPath(namespace, id, versionParam);
+    if (!safe.ok) {
+      res.status(404).json({ error: "Version not found." });
+      return;
+    }
+    if (versionParam === "latest") {
       const latest = findLatest(db, namespace, id);
       if (!latest) {
         res
@@ -1275,7 +1437,7 @@ export function createApp({ db, dataDir }) {
       });
       return;
     }
-    serveBlob(req, res, { db, dataDir, owner: namespace, id, version });
+    serveBlob(req, res, { db, dataDir, owner: namespace, id, version: versionParam });
   });
 
   // ── Approve extension (admin only) ───────────────────────────────────
@@ -1288,6 +1450,14 @@ export function createApp({ db, dataDir }) {
     }
     if (auth.user.type !== "admin") {
       res.status(403).json({ error: "Admin required." });
+      return;
+    }
+    if (
+      approveLimiter.isLimited(
+        `${auth.user.namespace}|${clientIp(req)}`,
+      )
+    ) {
+      rateLimited(res);
       return;
     }
 
@@ -1343,6 +1513,11 @@ export function createApp({ db, dataDir }) {
   `;
 
   app.get("/v2/search", (req, res) => {
+    if (searchLimiter.isLimited(clientIp(req))) {
+      rateLimited(res);
+      return;
+    }
+
     const raw = typeof req.query.query === "string" ? req.query.query : "";
     const q = raw.trim();
 
@@ -1434,6 +1609,11 @@ export function createApp({ db, dataDir }) {
   // ── Extensions ───────────────────────────────────────────────────────
 
   app.get("/v2/extensions", (req, res) => {
+    if (extensionsListLimiter.isLimited(clientIp(req))) {
+      rateLimited(res);
+      return;
+    }
+
     let limit = 20;
     if (req.query.limit !== undefined) {
       const parsed = Number(req.query.limit);
@@ -1517,7 +1697,12 @@ export function createApp({ db, dataDir }) {
 
   // ── Stats ────────────────────────────────────────────────────────────
 
-  app.get("/v2/stats", (_req, res) => {
+  app.get("/v2/stats", (req, res) => {
+    if (statsLimiter.isLimited(clientIp(req))) {
+      rateLimited(res);
+      return;
+    }
+
     const published = db
       .prepare(
         `SELECT COUNT(*) AS c FROM (
