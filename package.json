@@ -1,6 +1,6 @@
 {
   "name": "warp-registry",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "description": "Warp Registry — A Node registry of extensions created with Warp Compiler.",
@@ -25,6 +25,7 @@
     "better-sqlite3": "^13.0.3",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.7.0",
     "picocolors": "^1.1.1",
     "semver": "^7.6.2"
   },
@@ -34,5 +35,8 @@
     "eslint-config-prettier": "^10.1.8",
     "globals": "^17.11.0",
     "prettier": "^3.9.6"
+  },
+  "allowScripts": {
+    "better-sqlite3@13.0.3": true
   }
 }

@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import express from "express";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import semver from "semver";
 import { NAMESPACE_RE, blobPath, blobsDir } from "./db.js";
 import { extractWarpMeta } from "./warp-meta.js";
@@ -40,6 +41,15 @@ const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
  */
 const RATE_LIMIT_MAX = 5;
 const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+
+/**
+ * Default limit for the general-purpose request rate limiter. Generous on
+ * purpose: these limiters guard read-heavy and mutating endpoints against
+ * scraping/DoS-style floods while remaining permissive enough for legitimate
+ * traffic and tooling.
+ */
+const REQUEST_RATE_LIMIT_MAX = 1000;
+const REQUEST_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 
 /**
  * Fixed page size used for paginated /search results.
@@ -386,7 +396,7 @@ function isPendingConflict(err, db, ownerId, packageId, version) {
  * @returns {{user: object, tokenHash: string}|null} The authenticated user and token hash, or null.
  */
 function authenticate(db, authHeader) {
-  const match = /^Bearer\s+(.+)$/i.exec(authHeader || "");
+  const match = /^Bearer\s+(\S+)$/i.exec(authHeader || "");
   if (!match) return null;
   const token = match[1].trim();
   const tokenHash = hashToken(token);
@@ -461,7 +471,6 @@ function decodeCursor(raw, validate) {
  */
 export function createApp({ db, dataDir }) {
   const app = express();
-  app.use(express.json());
 
   if (!semverSortKeyRegistered.has(db)) {
     db.function("semverSortKey", { deterministic: true }, semverSortKey);
@@ -484,6 +493,46 @@ export function createApp({ db, dataDir }) {
 
   const clientIp = (req) =>
     req.ip || (req.socket && req.socket.remoteAddress) || "unknown";
+
+  const routeLimiter = rateLimit({
+    keyGenerator: (req) => ipKeyGenerator(clientIp(req)),
+    limit: REQUEST_RATE_LIMIT_MAX,
+    windowMs: REQUEST_RATE_LIMIT_WINDOW_MS,
+    handler: (req, res) =>
+      res.status(429).json({ error: "Too many attempts. Try again later." }),
+    standardHeaders: false,
+    legacyHeaders: false,
+  });
+
+  app.use("/v2", routeLimiter);
+  app.use(express.json());
+
+  const blobsBase = blobsDir(dataDir);
+
+  /**
+   * Validates that namespace, id, and version params are safe and that the
+   * resulting blob path stays within the intended blobs directory.
+   * @param {string} ns - The namespace parameter.
+   * @param {string} pkgId - The package id parameter.
+   * @param {string} ver - The version parameter (must be semver or "latest").
+   * @returns {{ ok: boolean, blobPath?: string, error?: string }}
+   */
+  function safeBlobPath(ns, pkgId, ver) {
+    if (!NAMESPACE_RE.test(ns)) {
+      return { ok: false, error: "Invalid namespace." };
+    }
+    if (!PACKAGE_ID_RE.test(pkgId)) {
+      return { ok: false, error: "Invalid package id." };
+    }
+    if (ver !== "latest" && semver.valid(ver) === null) {
+      return { ok: false, error: "Invalid version." };
+    }
+    const resolved = path.resolve(blobPath(dataDir, ns, pkgId, ver));
+    if (!resolved.startsWith(path.resolve(blobsBase) + path.sep)) {
+      return { ok: false, error: "Invalid path." };
+    }
+    return { ok: true, blobPath: resolved };
+  }
 
   app.post("/v2/auth/signup", async (req, res) => {
     const { namespace, displayName, password } = req.body || {};
@@ -876,7 +925,13 @@ export function createApp({ db, dataDir }) {
       return;
     }
 
-    const absBlobPath = blobPath(dataDir, ownerName, packageId, version);
+    const safe = safeBlobPath(ownerName, packageId, version);
+    if (!safe.ok) {
+      res.status(400).json({ error: safe.error });
+      error(safe.error);
+      return;
+    }
+    const absBlobPath = safe.blobPath;
     const tempBlobPath = `${absBlobPath}.tmp-${crypto
       .randomBytes(6)
       .toString("hex")}`;
@@ -1040,7 +1095,6 @@ export function createApp({ db, dataDir }) {
       res.status(401).json({ error: "Unauthorized." });
       return;
     }
-
     const { namespace, id } = req.params;
     const target = db
       .prepare("SELECT * FROM users WHERE namespace = ?")
@@ -1113,7 +1167,12 @@ export function createApp({ db, dataDir }) {
         return;
       }
 
-      const absBlobPath = blobPath(dataDir, namespace, id, version);
+      const safe = safeBlobPath(namespace, id, version);
+      if (!safe.ok) {
+        res.status(400).json({ error: safe.error });
+        return;
+      }
+      const absBlobPath = safe.blobPath;
       fs.mkdirSync(path.dirname(absBlobPath), { recursive: true });
       fs.writeFileSync(absBlobPath, extensionBlob);
 
@@ -1218,7 +1277,6 @@ export function createApp({ db, dataDir }) {
       res.status(401).json({ error: "Unauthorized." });
       return;
     }
-
     const { namespace, id } = req.params;
     const target = db
       .prepare("SELECT * FROM users WHERE namespace = ?")
@@ -1257,8 +1315,14 @@ export function createApp({ db, dataDir }) {
   // ── Serve extension source by version ────────────────────────────────
 
   app.get("/v2/@:namespace/:id/:version", (req, res) => {
-    const { namespace, id, version } = req.params;
-    if (version === "latest") {
+    const { namespace, id } = req.params;
+    const versionParam = req.params.version;
+    const safe = safeBlobPath(namespace, id, versionParam);
+    if (!safe.ok) {
+      res.status(404).json({ error: "Version not found." });
+      return;
+    }
+    if (versionParam === "latest") {
       const latest = findLatest(db, namespace, id);
       if (!latest) {
         res
@@ -1275,7 +1339,13 @@ export function createApp({ db, dataDir }) {
       });
       return;
     }
-    serveBlob(req, res, { db, dataDir, owner: namespace, id, version });
+    serveBlob(req, res, {
+      db,
+      dataDir,
+      owner: namespace,
+      id,
+      version: versionParam,
+    });
   });
 
   // ── Approve extension (admin only) ───────────────────────────────────
@@ -1517,7 +1587,7 @@ export function createApp({ db, dataDir }) {
 
   // ── Stats ────────────────────────────────────────────────────────────
 
-  app.get("/v2/stats", (_req, res) => {
+  app.get("/v2/stats", (req, res) => {
     const published = db
       .prepare(
         `SELECT COUNT(*) AS c FROM (

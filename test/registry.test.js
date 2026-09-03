@@ -10,7 +10,6 @@ import { openDatabase, blobPath } from "../src/db.js";
 import {
   createApp,
   hashToken,
-  hashPassword,
   reconcileStagedVersions,
 } from "../src/routes.js";
 
@@ -58,6 +57,7 @@ async function signup(
 
 /**
  * Inserts a new owner directly into the database and returns a token.
+ * Auth is via the returned token only; the password hash is a stub.
  * @param {import('better-sqlite3').Database} db - The database instance.
  * @param {string} namespace - The user namespace.
  * @param {boolean} [hasPublished=false] - Whether the user has published before.
@@ -66,8 +66,8 @@ async function signup(
 async function insertOwner(db, namespace, hasPublished = false) {
   const token = crypto.randomBytes(32).toString("hex");
   db.prepare(
-    "INSERT INTO users (namespace, display_name, password_hash, type, has_published) VALUES (?, '', ?, 'normal', ?)",
-  ).run(namespace, await hashPassword("testpassword123"), hasPublished ? 1 : 0);
+    "INSERT INTO users (namespace, display_name, password_hash, type, has_published) VALUES (?, '', 'stub', 'normal', ?)",
+  ).run(namespace, hasPublished ? 1 : 0);
   db.prepare("INSERT INTO auth_tokens (user_id, token_hash) VALUES (?, ?)").run(
     db.prepare("SELECT id FROM users WHERE namespace = ?").get(namespace).id,
     hashToken(token),
@@ -87,6 +87,7 @@ function insertApprovedOwner(db, namespace) {
 
 /**
  * Inserts an admin user directly into the database and returns a token.
+ * Auth is via the returned token only; the password hash is a stub.
  * @param {import('better-sqlite3').Database} db - The database instance.
  * @param {string} namespace - The admin namespace.
  * @returns {Promise<string>} The generated token.
@@ -94,8 +95,8 @@ function insertApprovedOwner(db, namespace) {
 async function insertAdmin(db, namespace) {
   const token = crypto.randomBytes(32).toString("hex");
   db.prepare(
-    "INSERT INTO users (namespace, display_name, password_hash, type, has_published) VALUES (?, '', ?, 'admin', 1)",
-  ).run(namespace, await hashPassword("testpassword123"));
+    "INSERT INTO users (namespace, display_name, password_hash, type, has_published) VALUES (?, '', 'stub', 'admin', 1)",
+  ).run(namespace);
   db.prepare("INSERT INTO auth_tokens (user_id, token_hash) VALUES (?, ?)").run(
     db.prepare("SELECT id FROM users WHERE namespace = ?").get(namespace).id,
     hashToken(token),
