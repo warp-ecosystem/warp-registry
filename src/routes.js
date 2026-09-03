@@ -471,7 +471,6 @@ function decodeCursor(raw, validate) {
  */
 export function createApp({ db, dataDir }) {
   const app = express();
-  app.use(express.json());
 
   if (!semverSortKeyRegistered.has(db)) {
     db.function("semverSortKey", { deterministic: true }, semverSortKey);
@@ -505,6 +504,9 @@ export function createApp({ db, dataDir }) {
     legacyHeaders: false,
   });
 
+  app.use("/v2", routeLimiter);
+  app.use(express.json());
+
   const blobsBase = blobsDir(dataDir);
 
   /**
@@ -532,7 +534,7 @@ export function createApp({ db, dataDir }) {
     return { ok: true, blobPath: resolved };
   }
 
-  app.post("/v2/auth/signup", routeLimiter, async (req, res) => {
+  app.post("/v2/auth/signup", async (req, res) => {
     const { namespace, displayName, password } = req.body || {};
     const rateKey = `signup:${clientIp(req)}`;
     const reject = (status, error) => {
@@ -617,7 +619,7 @@ export function createApp({ db, dataDir }) {
     res.status(201).json({ user: userResponse(user, db), token });
   });
 
-  app.post("/v2/auth/login", routeLimiter, async (req, res) => {
+  app.post("/v2/auth/login", async (req, res) => {
     const { namespace, password } = req.body || {};
     if (!namespace || typeof namespace !== "string") {
       res.status(400).json({ error: "namespace is required." });
@@ -655,7 +657,7 @@ export function createApp({ db, dataDir }) {
     res.status(200).json({ user: userResponse(user, db), token });
   });
 
-  app.post("/v2/auth/logout", routeLimiter, (req, res) => {
+  app.post("/v2/auth/logout", (req, res) => {
     const auth = authenticate(db, req.headers.authorization);
     if (!auth) {
       res.status(401).json({ error: "Unauthorized." });
@@ -669,7 +671,7 @@ export function createApp({ db, dataDir }) {
 
   // ── User routes ──────────────────────────────────────────────────────
 
-  app.get("/v2/users", routeLimiter, (req, res) => {
+  app.get("/v2/users", (req, res) => {
     let limit = 20;
     if (req.query.limit !== undefined) {
       const parsed = Number(req.query.limit);
@@ -714,7 +716,7 @@ export function createApp({ db, dataDir }) {
     });
   });
 
-  app.get("/v2/users/:namespace", routeLimiter, (req, res) => {
+  app.get("/v2/users/:namespace", (req, res) => {
     const user = db
       .prepare("SELECT * FROM users WHERE namespace = ?")
       .get(req.params.namespace);
@@ -725,7 +727,7 @@ export function createApp({ db, dataDir }) {
     res.json(userResponse(user, db));
   });
 
-  app.patch("/v2/users/:namespace", routeLimiter, async (req, res) => {
+  app.patch("/v2/users/:namespace", async (req, res) => {
     const auth = authenticate(db, req.headers.authorization);
     if (!auth) {
       res.status(401).json({ error: "Unauthorized." });
@@ -784,7 +786,7 @@ export function createApp({ db, dataDir }) {
     res.json(userResponse(updated, db));
   });
 
-  app.delete("/v2/users/:namespace", routeLimiter, (req, res) => {
+  app.delete("/v2/users/:namespace", (req, res) => {
     const auth = authenticate(db, req.headers.authorization);
     if (!auth) {
       res.status(401).json({ error: "Unauthorized." });
@@ -825,7 +827,7 @@ export function createApp({ db, dataDir }) {
 
   // ── Publish route ────────────────────────────────────────────────────
 
-  app.post("/v2/publish", routeLimiter, (req, res, next) => {
+  app.post("/v2/publish", (req, res, next) => {
     const auth = authenticate(db, req.headers.authorization);
     if (!auth) {
       res.status(401).json({ error: "Unauthorized." });
@@ -1045,7 +1047,7 @@ export function createApp({ db, dataDir }) {
 
   // ── Extension info ───────────────────────────────────────────────────
 
-  app.get("/v2/@:namespace/:id", routeLimiter, (req, res) => {
+  app.get("/v2/@:namespace/:id", (req, res) => {
     const { namespace, id } = req.params;
     const rows = db
       .prepare(
@@ -1087,7 +1089,7 @@ export function createApp({ db, dataDir }) {
 
   // ── Update extension ─────────────────────────────────────────────────
 
-  app.patch("/v2/@:namespace/:id", routeLimiter, (req, res) => {
+  app.patch("/v2/@:namespace/:id", (req, res) => {
     const auth = authenticate(db, req.headers.authorization);
     if (!auth) {
       res.status(401).json({ error: "Unauthorized." });
@@ -1269,7 +1271,7 @@ export function createApp({ db, dataDir }) {
 
   // ── Delete extension ─────────────────────────────────────────────────
 
-  app.delete("/v2/@:namespace/:id", routeLimiter, (req, res) => {
+  app.delete("/v2/@:namespace/:id", (req, res) => {
     const auth = authenticate(db, req.headers.authorization);
     if (!auth) {
       res.status(401).json({ error: "Unauthorized." });
@@ -1312,7 +1314,7 @@ export function createApp({ db, dataDir }) {
 
   // ── Serve extension source by version ────────────────────────────────
 
-  app.get("/v2/@:namespace/:id/:version", routeLimiter, (req, res) => {
+  app.get("/v2/@:namespace/:id/:version", (req, res) => {
     const { namespace, id } = req.params;
     const versionParam = req.params.version;
     const safe = safeBlobPath(namespace, id, versionParam);
@@ -1348,7 +1350,7 @@ export function createApp({ db, dataDir }) {
 
   // ── Approve extension (admin only) ───────────────────────────────────
 
-  app.post("/v2/@:namespace/:id/approve", routeLimiter, (req, res) => {
+  app.post("/v2/@:namespace/:id/approve", (req, res) => {
     const auth = authenticate(db, req.headers.authorization);
     if (!auth) {
       res.status(401).json({ error: "Unauthorized." });
@@ -1410,7 +1412,7 @@ export function createApp({ db, dataDir }) {
     WHERE v.status = 'published'
   `;
 
-  app.get("/v2/search", routeLimiter, (req, res) => {
+  app.get("/v2/search", (req, res) => {
     const raw = typeof req.query.query === "string" ? req.query.query : "";
     const q = raw.trim();
 
@@ -1501,7 +1503,7 @@ export function createApp({ db, dataDir }) {
 
   // ── Extensions ───────────────────────────────────────────────────────
 
-  app.get("/v2/extensions", routeLimiter, (req, res) => {
+  app.get("/v2/extensions", (req, res) => {
     let limit = 20;
     if (req.query.limit !== undefined) {
       const parsed = Number(req.query.limit);
@@ -1585,7 +1587,7 @@ export function createApp({ db, dataDir }) {
 
   // ── Stats ────────────────────────────────────────────────────────────
 
-  app.get("/v2/stats", routeLimiter, (req, res) => {
+  app.get("/v2/stats", (req, res) => {
     const published = db
       .prepare(
         `SELECT COUNT(*) AS c FROM (
